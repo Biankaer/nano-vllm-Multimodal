@@ -1,0 +1,132 @@
+# NanoInfer Architecture
+
+## Current Layering
+
+Phase 2 introduces the first architecture split:
+
+```text
+LLMEngine
+  -> EngineCore
+      -> Scheduler
+      -> Executor
+          -> GPUWorker
+              -> ModelRunner
+                  -> Qwen3ForCausalLM
+```
+
+## Responsibilities
+
+### LLMEngine
+
+User-facing offline API.
+
+Responsibilities:
+
+- Build `Config`.
+- Load tokenizer.
+- Convert prompts into token ids.
+- Create `Sequence` objects.
+- Decode completion token ids into text.
+- Preserve the original `LLM.generate()` interface.
+
+### EngineCore
+
+Request lifecycle and scheduling orchestration.
+
+Responsibilities:
+
+- Own `Scheduler`.
+- Own `Executor`.
+- Accept internal `Sequence` objects.
+- Run one engine step:
+  - schedule sequences
+  - execute model
+  - postprocess generated token ids
+  - return newly finished outputs
+
+Future responsibilities:
+
+- Async request admission.
+- Per-request state tracking.
+- Streaming token handoff.
+- TTFT and TPOT measurement.
+
+### Executor
+
+Model execution abstraction.
+
+Responsibilities:
+
+- Start tensor-parallel child processes.
+- Own the driver `GPUWorker`.
+- Forward execution requests from `EngineCore` to GPU workers.
+- Shutdown workers and join child processes.
+
+Future responsibilities:
+
+- Switch between local GPU, remote worker, or mock executor.
+- Expose worker health and execution metrics.
+- Support multimodal workers.
+
+### GPUWorker
+
+Single GPU worker wrapper.
+
+Responsibilities:
+
+- Wrap the existing `ModelRunner`.
+- Keep CUDA/model/KV-cache details out of `EngineCore`.
+- Provide stable `run()` and `shutdown()` methods.
+
+### ModelRunner
+
+Low-level model runtime from the original nano-vLLM.
+
+Responsibilities:
+
+- Load model weights.
+- Allocate KV cache.
+- Prepare prefill/decode tensors.
+- Execute model forward.
+- Run sampler.
+- Handle tensor-parallel shared-memory protocol.
+
+## Why This Split Matters
+
+The original nano-vLLM code is compact and readable, but the API layer, scheduler,
+worker startup, and model execution path are tightly coupled. This split creates
+clear extension points for:
+
+- OpenAI-compatible serving.
+- Continuous batching.
+- Chunked prefill scheduling.
+- Speculative decoding.
+- Multimodal image-text preprocessing and worker execution.
+- Benchmark and metrics instrumentation.
+
+## Current Execution Path
+
+Offline generation still starts from:
+
+```python
+outputs = llm.generate(prompts, sampling_params)
+```
+
+Internally it now flows through:
+
+```text
+LLM.generate()
+  -> LLM.add_request()
+      -> EngineCore.add_sequence()
+  -> while not LLM.is_finished()
+      -> LLM.step()
+          -> EngineCore.step()
+              -> Scheduler.schedule()
+              -> Executor.run()
+                  -> GPUWorker.run()
+                      -> ModelRunner.call("run", ...)
+              -> Scheduler.postprocess()
+  -> tokenizer.decode()
+```
+
+This preserves behavior while making the engine easier to evolve.

@@ -13,9 +13,6 @@ from tqdm.auto import tqdm
 # AutoTokenizer 负责文本和 token ids 的互转，也提供 eos_token_id。
 from transformers import AutoTokenizer
 
-# torch.multiprocessing 用于启动 tensor parallel 的多个 ModelRunner 进程。
-import torch.multiprocessing as mp
-
 # Config 保存引擎级别配置，如 batch 上限、KV cache 块大小、并行规模等。
 from nanovllm.config import Config
 
@@ -25,11 +22,8 @@ from nanovllm.sampling_params import SamplingParams
 # Sequence 表示一条推理请求在引擎内部的状态，包括 token、block table、生成进度等。
 from nanovllm.engine.sequence import Sequence
 
-# Scheduler 决定每一步执行哪些 Sequence，以及它们处于 prefill 还是 decode。
-from nanovllm.engine.scheduler import Scheduler
-
-# ModelRunner 真正持有模型、KV cache，并在 GPU 上执行 forward 和采样。
-from nanovllm.engine.model_runner import ModelRunner
+# EngineCore 负责请求生命周期、调度和执行编排。
+from nanovllm.engine.engine_core import EngineCore
 
 
 class LLMEngine:
@@ -54,58 +48,25 @@ class LLMEngine:
         # Sequence.block_size 是类变量，所有请求共享同一个 KV cache block 粒度。
         Sequence.block_size = config.kvcache_block_size
 
-        # 保存 tensor parallel 子进程对象，后续退出时需要 join。
-        self.ps = []
-
-        # 保存主进程通知子进程执行某个方法的 Event。
-        self.events = []
-
-        # 使用 spawn 启动子进程。CUDA 多进程一般避免 fork，spawn 更干净。
-        ctx = mp.get_context("spawn")
-
-        # rank 0 留在当前主进程，rank 1 到 N-1 用子进程启动。
-        for i in range(1, config.tensor_parallel_size):
-            # 每个子进程对应一个 Event，主进程写共享内存后 set 这个 Event。
-            event = ctx.Event()
-
-            # 子进程入口就是 ModelRunner(config, rank, event)。
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-
-            # 真正启动子进程；子进程初始化模型后会进入 ModelRunner.loop() 等待命令。
-            process.start()
-
-            # 记录子进程对象，exit() 中需要等待它退出。
-            self.ps.append(process)
-
-            # 记录通信 Event，rank 0 的 ModelRunner.call() 会用这些 Event 唤醒子进程。
-            self.events.append(event)
-
-        # rank 0 的 ModelRunner 在主进程里创建；event 列表用于通知其它 rank。
-        self.model_runner = ModelRunner(config, 0, self.events)
-
         # 加载 tokenizer；use_fast=True 使用 Rust 实现的 fast tokenizer。
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
 
         # 把 EOS token id 写回 config，Scheduler 用它判断生成是否结束。
         config.eos = self.tokenizer.eos_token_id
 
-        # 创建调度器。注意此时 config.num_kvcache_blocks 已经被 ModelRunner 填好了。
-        self.scheduler = Scheduler(config)
+        # 创建 EngineCore。EngineCore 会初始化 Executor，再创建 Scheduler。
+        # Executor 内部创建 GPUWorker/ModelRunner，并填充 config.num_kvcache_blocks。
+        self.core = EngineCore(config)
 
         # 注册退出清理，用户即使没有显式调用 exit，也尽量释放分布式/共享内存资源。
         atexit.register(self.exit)
 
     def exit(self):
         """程序退出时的清理：通知子进程退出，等待子进程结束"""
-        # 通过 ModelRunner.call("exit") 同时通知 rank 0 和所有子 rank 执行退出逻辑。
-        self.model_runner.call("exit")
-
-        # 删除主进程 ModelRunner，触发 Python 对其持有对象的释放。
-        del self.model_runner
-
-        # 等待所有 tensor parallel 子进程结束，避免僵尸进程。
-        for p in self.ps:
-            p.join()
+        # EngineCore 会向 Executor/GPUWorker 转发退出逻辑，并等待子进程结束。
+        if hasattr(self, "core"):
+            self.core.shutdown()
+            del self.core
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         """
@@ -121,8 +82,8 @@ class LLMEngine:
         # Sequence 是内部请求状态对象，会保存 prompt token、生成 token、KV block table 等。
         seq = Sequence(prompt, sampling_params)
 
-        # 新请求先进入 Scheduler.waiting 队列，等待 prefill。
-        self.scheduler.add(seq)
+        # 新请求先进入 EngineCore 内部 Scheduler.waiting 队列，等待 prefill。
+        self.core.add_sequence(seq)
 
     def step(self):
         """
@@ -135,29 +96,13 @@ class LLMEngine:
             outputs: 已完成的序列列表（seq_id, 生成的 token_ids）
             num_tokens: 正数=prefill 处理的 token 数，负数=-decode 序列数（用于吞吐量计算）
         """
-        # 让调度器选出本轮要运行的序列，并告诉我们本轮是 prefill 还是 decode。
-        seqs, is_prefill = self.scheduler.schedule()
-
-        # prefill 一次可能处理很多 token；decode 每条序列只处理 1 个 token。
-        # 这里用正数表示 prefill token 数，用负数表示 decode 序列数，方便进度条区分。
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-
-        # 调用模型执行器：准备张量、跑模型、采样，最后返回每条序列的新 token。
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-
-        # 调度器后处理：更新 KV cache 进度、append token、检查 EOS/max_tokens。
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-
-        # 只收集本轮刚完成的序列；未完成的会继续留在 running 队列中。
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-
-        # 返回完成结果和本轮吞吐统计所需的 token/sequence 数。
-        return outputs, num_tokens
+        # 具体的 schedule -> execute -> postprocess 已经下沉到 EngineCore。
+        return self.core.step()
 
     def is_finished(self):
         """所有请求是否都已处理完成"""
-        # Scheduler 同时没有 waiting 和 running 请求时，整个批次就结束了。
-        return self.scheduler.is_finished()
+        # EngineCore 内部 Scheduler 同时没有 waiting 和 running 请求时，整个批次就结束了。
+        return self.core.is_finished()
 
     def generate(
         self,

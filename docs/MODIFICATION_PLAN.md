@@ -88,12 +88,17 @@ Files:
 
 ### Phase 2: EngineCore / Executor Split
 
+Status: basic split implemented.
+
 Deliverables:
 
-- Introduce `EngineCore` as request lifecycle owner.
-- Introduce `Executor` as model execution abstraction.
-- Move direct `ModelRunner.call("run", ...)` behind `Executor`.
-- Preserve existing scheduler behavior.
+- [x] Introduce `EngineCore` as request lifecycle owner.
+- [x] Introduce `Executor` as model execution abstraction.
+- [x] Move direct `ModelRunner.call("run", ...)` behind `Executor`.
+- [x] Preserve existing scheduler behavior.
+- [ ] Add async request admission for serving.
+- [ ] Add per-request timing and state tracking.
+- [ ] Add streaming token handoff.
 
 Target files:
 
@@ -305,4 +310,3 @@ The first coding milestone should be intentionally small:
 6. Add compile checks.
 
 This creates a clean project base without breaking the original engine.
-

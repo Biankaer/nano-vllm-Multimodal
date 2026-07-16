@@ -17,6 +17,11 @@ Phase 1 has started:
 - Added FastAPI app skeleton.
 - Added `/v1/completions` and `/v1/chat/completions` non-streaming endpoints.
 - Added multimodal request, image loading, image feature cache, and processor skeletons.
+- Added the first EngineCore / Executor / GPUWorker split while preserving the original offline API.
+
+Architecture notes:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Roadmap
 
