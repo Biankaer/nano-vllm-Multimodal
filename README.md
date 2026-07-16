@@ -27,6 +27,7 @@ multimodal batching milestones:
 
 Architecture notes:
 
+- [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [docs/IMPLEMENTATION_RETROSPECTIVE.md](docs/IMPLEMENTATION_RETROSPECTIVE.md)
 
