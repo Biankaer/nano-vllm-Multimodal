@@ -151,14 +151,20 @@ Target files:
 
 ### Phase 5: Multimodal VLM Serving
 
+Status: Qwen2.5-VL backend scaffold implemented.
+
 Deliverables:
 
-- Add multimodal request schema compatible with OpenAI chat content parts.
-- Support image URL and base64 image input.
-- Add image preprocessing abstraction.
-- Add multimodal processor abstraction.
-- Add image feature cache.
-- Add image-text batching policy hooks.
+- [x] Add multimodal request schema compatible with OpenAI chat content parts.
+- [x] Support image URL and base64 image input in schema and loader scaffolding.
+- [x] Add image preprocessing abstraction.
+- [x] Add multimodal processor abstraction.
+- [x] Add image feature cache.
+- [x] Add Qwen2.5-VL HuggingFace backend for first real VLM path.
+- [x] Route image-text chat requests from `/v1/chat/completions`.
+- [ ] Add image-text batching policy hooks.
+- [ ] Add server-side multimodal benchmark.
+- [ ] Move vision encoding and image feature cache into engine scheduling path.
 
 Target files:
 
@@ -166,6 +172,7 @@ Target files:
 - `nanovllm/multimodal/image_loader.py`
 - `nanovllm/multimodal/processor.py`
 - `nanovllm/multimodal/cache.py`
+- `nanovllm/multimodal/qwen25_vl.py`
 - `nanovllm/multimodal/scheduler_policy.py`
 - `bench_multimodal.py`
 

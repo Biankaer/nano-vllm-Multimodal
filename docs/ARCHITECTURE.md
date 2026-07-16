@@ -161,3 +161,32 @@ LLMEngine
 
 These stats are intentionally dependency-free. Serving and benchmark modules can
 later export them to Prometheus, JSON benchmark reports, or logs.
+
+## Multimodal Path
+
+Phase 5 starts with a pragmatic two-backend design:
+
+```text
+Text-only request
+  -> OpenAI API
+  -> EngineClient.generate()
+  -> NanoInfer text engine
+
+Image-text request
+  -> OpenAI API
+  -> EngineClient.generate_multimodal_chat()
+  -> Qwen25VLBackend
+  -> HuggingFace Qwen2.5-VL
+```
+
+This keeps the original nano-vLLM text runtime intact while adding a real
+open-source VLM backend. The current Qwen2.5-VL backend is a functional bridge,
+not the final optimized serving path. Later phases should move these pieces into
+the engine:
+
+- image preprocessing queue
+- image feature cache
+- vision encoder batching
+- image-token budget accounting
+- multimodal KV cache statistics
+- mixed text/image scheduling

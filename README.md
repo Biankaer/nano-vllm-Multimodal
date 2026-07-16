@@ -19,6 +19,7 @@ Phase 1 has started:
 - Added multimodal request, image loading, image feature cache, and processor skeletons.
 - Added the first EngineCore / Executor / GPUWorker split while preserving the original offline API.
 - Added metrics foundation for scheduler state, KV cache usage, per-step throughput, TTFT, TPOT, and request latency.
+- Added a Qwen2.5-VL HuggingFace backend for image-text chat requests.
 
 Architecture notes:
 
@@ -51,6 +52,12 @@ Serving extras:
 pip install -e ".[serving]"
 ```
 
+Multimodal extras:
+
+```bash
+pip install -e ".[all]"
+```
+
 ## Model Download
 
 ```bash
@@ -76,6 +83,15 @@ Start the server:
 
 ```bash
 NANOINFER_MODEL=~/huggingface/Qwen3-0.6B/ \
+uvicorn nanovllm.serving.entrypoint:app --host 0.0.0.0 --port 8000
+```
+
+Start with a Qwen2.5-VL multimodal backend:
+
+```bash
+NANOINFER_MODEL=~/huggingface/Qwen3-0.6B/ \
+NANOINFER_MM_MODEL=~/huggingface/Qwen2.5-VL-3B-Instruct/ \
+NANOINFER_MM_DTYPE=bfloat16 \
 uvicorn nanovllm.serving.entrypoint:app --host 0.0.0.0 --port 8000
 ```
 
@@ -107,19 +123,39 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+Image-text chat request:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-vl",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}},
+          {"type": "text", "text": "Describe this image."}
+        ]
+      }
+    ],
+    "max_tokens": 128,
+    "temperature": 0.2
+  }'
+```
+
 ## Multimodal Direction
 
 The first multimodal milestone introduces request schemas and model-agnostic image
-feature caching. Later phases will connect these abstractions to a real VLM path:
+feature caching. The first real VLM backend is Qwen2.5-VL through HuggingFace
+Transformers:
 
 ```text
 image + text
   -> image loader / preprocessing
-  -> vision encoder
-  -> image feature cache
-  -> multimodal prompt assembly
-  -> scheduler
-  -> LLM decode
+  -> Qwen2.5-VL processor
+  -> Qwen2.5-VL model generate
+  -> OpenAI-compatible response
 ```
 
 Optimization goals:
