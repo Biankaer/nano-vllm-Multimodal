@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class CompletionRequest(BaseModel):
     model: str | None = None
     prompt: str | list[str]
-    max_tokens: int = Field(default=64, ge=1)
+    max_tokens: int = Field(
+        default=64,
+        ge=1,
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
+    )
     temperature: float = Field(default=1.0, gt=0.0)
     stream: bool = False
     ignore_eos: bool = False
@@ -52,7 +56,7 @@ class ImageContentPart(BaseModel):
     image_url: ImageUrl
 
 
-ChatContentPart = TextContentPart | ImageContentPart
+ChatContentPart = Annotated[TextContentPart | ImageContentPart, Field(discriminator="type")]
 
 
 class ChatMessage(BaseModel):
@@ -62,9 +66,14 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
-    messages: list[ChatMessage]
-    max_tokens: int = Field(default=64, ge=1)
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_tokens: int = Field(
+        default=64,
+        ge=1,
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
+    )
     temperature: float = Field(default=1.0, gt=0.0)
+    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     stream: bool = False
     ignore_eos: bool = False
 

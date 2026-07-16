@@ -20,6 +20,9 @@ Phase 1 has started:
 - Added the first EngineCore / Executor / GPUWorker split while preserving the original offline API.
 - Added metrics foundation for scheduler state, KV cache usage, per-step throughput, TTFT, TPOT, and request latency.
 - Added a Qwen2.5-VL HuggingFace backend for image-text chat requests.
+- Added an OpenAI-to-Qwen2.5-VL request adapter for URL, base64, file URL, and trusted local-path images.
+- Added engine-owned multimodal request batching, image/text token budgets, and decoded-image LRU caching.
+- Added a concurrent multimodal benchmark with latency percentiles and server-side cache/batch metrics.
 
 Architecture notes:
 
@@ -92,8 +95,37 @@ Start with a Qwen2.5-VL multimodal backend:
 NANOINFER_MODEL=~/huggingface/Qwen3-0.6B/ \
 NANOINFER_MM_MODEL=~/huggingface/Qwen2.5-VL-3B-Instruct/ \
 NANOINFER_MM_DTYPE=bfloat16 \
+NANOINFER_MM_MAX_BATCH_SIZE=8 \
+NANOINFER_MM_BATCH_WAIT_MS=5 \
+NANOINFER_MM_CACHE_CAPACITY=256 \
 uvicorn nanovllm.serving.entrypoint:app --host 0.0.0.0 --port 8000
 ```
+
+The `image_url.url` field accepts HTTP(S) URLs and base64 data URLs. Multiple
+image and text parts may be interleaved in one message. Trusted deployments can
+also enable `file://` URLs and server-local paths with
+`NANOINFER_MM_ALLOW_LOCAL_FILES=1`; local file access is disabled by default.
+
+## Multimodal Benchmark
+
+Run concurrent requests against a local image:
+
+```bash
+python bench_multimodal.py \
+  --server-url http://127.0.0.1:8000 \
+  --model qwen2.5-vl \
+  --image ./assets/demo.jpg \
+  --prompt "Describe the image and list the visible objects." \
+  --num-requests 32 \
+  --concurrency 8 \
+  --max-tokens 128 \
+  --output-json benchmark-results/qwen25-vl.json
+```
+
+Repeat `--image` to benchmark multi-image requests. The report includes request
+throughput, average/P50/P90/P99 latency, failures, actual average server batch
+size, and image cache counters from `/metrics/multimodal`. TTFT and TPOT remain
+empty until streaming SSE is implemented.
 
 Completion request:
 

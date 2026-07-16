@@ -25,6 +25,8 @@ class ImageFeatureCache:
     """
 
     def __init__(self, capacity: int = 256):
+        if capacity < 1:
+            raise ValueError("cache capacity must be at least 1")
         self.capacity = capacity
         self._items: OrderedDict[str, Any] = OrderedDict()
         self.stats = CacheStats()
@@ -47,3 +49,13 @@ class ImageFeatureCache:
         if len(self._items) > self.capacity:
             self._items.popitem(last=False)
             self.stats.evictions += 1
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class ImageAssetCache(ImageFeatureCache):
+    """LRU cache for decoded image objects before vision preprocessing."""

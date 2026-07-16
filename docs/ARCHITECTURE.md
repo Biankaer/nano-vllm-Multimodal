@@ -174,19 +174,44 @@ Text-only request
 
 Image-text request
   -> OpenAI API
-  -> EngineClient.generate_multimodal_chat()
-  -> Qwen25VLBackend
+  -> OpenAI request adapter
+  -> MultimodalEngineCore
+      -> MultimodalBatcher
+      -> MultimodalManager
+          -> decoded image LRU cache
+          -> image feature cache hook
+      -> Qwen25VLBackend.generate_chat_batch()
   -> HuggingFace Qwen2.5-VL
 ```
 
-This keeps the original nano-vLLM text runtime intact while adding a real
-open-source VLM backend. The current Qwen2.5-VL backend is a functional bridge,
-not the final optimized serving path. Later phases should move these pieces into
-the engine:
+The API no longer invokes the HuggingFace backend directly. Concurrent requests
+enter an engine-owned queue, wait for a short configurable batching window, and
+are grouped only when their generation parameters and image buckets are
+compatible. The scheduler enforces separate text-token, image-token, image-count,
+and request-count budgets.
 
-- image preprocessing queue
-- image feature cache
-- vision encoder batching
+Decoded image objects are cached below the API layer, so repeated URL, data URL,
+or local-path inputs avoid repeated fetching and image decoding. The feature
+cache is already owned by `MultimodalManager`, but it remains a hook until the
+Qwen vision encoder is split from HuggingFace `generate()`.
+
+The current Qwen2.5-VL backend remains a functional bridge rather than the final
+custom CUDA runtime. Later phases should continue moving these pieces into the
+engine:
+
+- asynchronous image fetching and preprocessing workers
+- active vision feature reuse
+- shape-aware vision encoder micro-batching
 - image-token budget accounting
 - multimodal KV cache statistics
 - mixed text/image scheduling
+
+Current multimodal environment knobs:
+
+```text
+NANOINFER_MM_MAX_BATCH_SIZE
+NANOINFER_MM_MAX_IMAGES_PER_BATCH
+NANOINFER_MM_BATCH_WAIT_MS
+NANOINFER_MM_CACHE_CAPACITY
+NANOINFER_MM_ALLOW_LOCAL_FILES
+```

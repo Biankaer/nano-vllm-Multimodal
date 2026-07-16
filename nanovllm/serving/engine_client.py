@@ -5,7 +5,10 @@ from threading import Lock
 from typing import Any
 
 from nanovllm import LLM, SamplingParams
+from nanovllm.engine.multimodal_engine import MultimodalEngineCore, MultimodalEngineStats
 from nanovllm.multimodal import Qwen25VLBackend, Qwen25VLConfig
+from nanovllm.multimodal.scheduler_policy import MultimodalBatchPolicy
+from nanovllm.multimodal.schemas import MultimodalRequest
 
 
 @dataclass(slots=True)
@@ -17,6 +20,11 @@ class EngineClientConfig:
     multimodal_device_map: str = "auto"
     multimodal_torch_dtype: str = "auto"
     multimodal_attn_implementation: str | None = None
+    multimodal_max_batch_size: int = 8
+    multimodal_max_images_per_batch: int = 8
+    multimodal_batch_wait_ms: float = 5.0
+    multimodal_cache_capacity: int = 256
+    multimodal_allow_local_files: bool = False
 
 
 class EngineClient:
@@ -32,8 +40,9 @@ class EngineClient:
         self.config = config
         self._llm: LLM | None = None
         self._multimodal_backend: Qwen25VLBackend | None = None
+        self._multimodal_core: MultimodalEngineCore | None = None
         self._lock = Lock()
-        self._multimodal_lock = Lock()
+        self._multimodal_init_lock = Lock()
 
     @property
     def llm(self) -> LLM:
@@ -78,14 +87,42 @@ class EngineClient:
 
     def generate_multimodal_chat(
         self,
-        messages: list[dict[str, Any]],
+        request: MultimodalRequest,
         *,
         temperature: float,
         max_tokens: int,
+        top_p: float = 1.0,
     ) -> str:
-        with self._multimodal_lock:
-            return self.multimodal_backend.generate_chat(
-                messages,
-                temperature=temperature,
-                max_new_tokens=max_tokens,
-            )
+        return self.multimodal_core.generate(
+            request,
+            temperature=temperature,
+            max_new_tokens=max_tokens,
+            top_p=top_p,
+        )
+
+    @property
+    def multimodal_core(self) -> MultimodalEngineCore:
+        if self._multimodal_core is None:
+            with self._multimodal_init_lock:
+                if self._multimodal_core is None:
+                    policy = MultimodalBatchPolicy(
+                        max_batch_size=self.config.multimodal_max_batch_size,
+                        max_images_per_batch=self.config.multimodal_max_images_per_batch,
+                        batch_wait_ms=self.config.multimodal_batch_wait_ms,
+                    )
+                    self._multimodal_core = MultimodalEngineCore(
+                        self.multimodal_backend,
+                        policy=policy,
+                        asset_cache_capacity=self.config.multimodal_cache_capacity,
+                        feature_cache_capacity=self.config.multimodal_cache_capacity,
+                    )
+        return self._multimodal_core
+
+    def multimodal_stats(self) -> MultimodalEngineStats | None:
+        return self._multimodal_core.stats() if self._multimodal_core is not None else None
+
+    def shutdown(self) -> None:
+        if self._multimodal_core is not None:
+            self._multimodal_core.shutdown()
+        if self._llm is not None:
+            self._llm.exit()

@@ -12,6 +12,11 @@ MULTIMODAL_MODEL_PATH = os.environ.get("NANOINFER_MM_MODEL")
 MULTIMODAL_DEVICE_MAP = os.environ.get("NANOINFER_MM_DEVICE_MAP", "auto")
 MULTIMODAL_TORCH_DTYPE = os.environ.get("NANOINFER_MM_DTYPE", "auto")
 MULTIMODAL_ATTN_IMPL = os.environ.get("NANOINFER_MM_ATTN_IMPL") or None
+MULTIMODAL_MAX_BATCH_SIZE = int(os.environ.get("NANOINFER_MM_MAX_BATCH_SIZE", "8"))
+MULTIMODAL_MAX_IMAGES_PER_BATCH = int(os.environ.get("NANOINFER_MM_MAX_IMAGES_PER_BATCH", "8"))
+MULTIMODAL_BATCH_WAIT_MS = float(os.environ.get("NANOINFER_MM_BATCH_WAIT_MS", "5"))
+MULTIMODAL_CACHE_CAPACITY = int(os.environ.get("NANOINFER_MM_CACHE_CAPACITY", "256"))
+MULTIMODAL_ALLOW_LOCAL_FILES = os.environ.get("NANOINFER_MM_ALLOW_LOCAL_FILES", "0") in {"1", "true", "True"}
 
 app = create_app(
     MODEL_PATH,
@@ -21,4 +26,9 @@ app = create_app(
     multimodal_device_map=MULTIMODAL_DEVICE_MAP,
     multimodal_torch_dtype=MULTIMODAL_TORCH_DTYPE,
     multimodal_attn_implementation=MULTIMODAL_ATTN_IMPL,
+    multimodal_max_batch_size=MULTIMODAL_MAX_BATCH_SIZE,
+    multimodal_max_images_per_batch=MULTIMODAL_MAX_IMAGES_PER_BATCH,
+    multimodal_batch_wait_ms=MULTIMODAL_BATCH_WAIT_MS,
+    multimodal_cache_capacity=MULTIMODAL_CACHE_CAPACITY,
+    multimodal_allow_local_files=MULTIMODAL_ALLOW_LOCAL_FILES,
 )

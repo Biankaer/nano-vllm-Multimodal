@@ -45,7 +45,7 @@ all = [
 ]
 
 [project.urls]
-Homepage="https://github.com/YOUR_GITHUB_USERNAME/nanoinfer"
+Homepage="https://github.com/Biankaer/nano-vllm-Multimodal"
 
 [tool.setuptools.packages.find]
 where = ["."]

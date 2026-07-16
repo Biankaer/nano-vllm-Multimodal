@@ -151,20 +151,23 @@ Target files:
 
 ### Phase 5: Multimodal VLM Serving
 
-Status: Qwen2.5-VL backend scaffold implemented.
+Status: Qwen2.5-VL backend and request-level engine batching implemented.
 
 Deliverables:
 
 - [x] Add multimodal request schema compatible with OpenAI chat content parts.
-- [x] Support image URL and base64 image input in schema and loader scaffolding.
+- [x] Support HTTP(S), base64 data URL, file URL, and trusted server-local image paths.
+- [x] Add a dedicated OpenAI-to-Qwen2.5-VL request adapter with interleaved image/text ordering.
 - [x] Add image preprocessing abstraction.
 - [x] Add multimodal processor abstraction.
 - [x] Add image feature cache.
 - [x] Add Qwen2.5-VL HuggingFace backend for first real VLM path.
 - [x] Route image-text chat requests from `/v1/chat/completions`.
-- [ ] Add image-text batching policy hooks.
-- [ ] Add server-side multimodal benchmark.
-- [ ] Move vision encoding and image feature cache into engine scheduling path.
+- [x] Add request-level image-text continuous batching with generation-parameter compatibility checks.
+- [x] Add text-token, image-token, image-count, and batch-size scheduling budgets.
+- [x] Add concurrent server-side multimodal benchmark with P50/P90/P99 and engine metric collection.
+- [x] Move decoded image caching, batching, and scheduling ownership below the API into `MultimodalEngineCore`.
+- [ ] Split Qwen2.5-VL vision encoding from language generation and activate engine-owned feature reuse.
 
 Target files:
 
@@ -174,6 +177,11 @@ Target files:
 - `nanovllm/multimodal/cache.py`
 - `nanovllm/multimodal/qwen25_vl.py`
 - `nanovllm/multimodal/scheduler_policy.py`
+- `nanovllm/multimodal/openai_adapter.py`
+- `nanovllm/multimodal/request.py`
+- `nanovllm/multimodal/batching.py`
+- `nanovllm/multimodal/manager.py`
+- `nanovllm/engine/multimodal_engine.py`
 - `bench_multimodal.py`
 
 ## 5. Multimodal Optimization Plan

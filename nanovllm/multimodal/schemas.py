@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass(slots=True)
@@ -16,3 +16,4 @@ class MultimodalRequest:
     text: str
     images: list[ImageInput] = field(default_factory=list)
     request_id: str | None = None
+    messages: list[dict[str, Any]] = field(default_factory=list)

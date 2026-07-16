@@ -33,17 +33,42 @@ class Qwen25VLBackend:
         *,
         max_new_tokens: int,
         temperature: float,
+        top_p: float = 1.0,
     ) -> str:
+        return self.generate_chat_batch(
+            [messages],
+            image_inputs_batch=None,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )[0]
+
+    def generate_chat_batch(
+        self,
+        messages_batch: list[list[dict[str, Any]]],
+        *,
+        image_inputs_batch: list[list[object]] | None,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float = 1.0,
+    ) -> list[str]:
         self._ensure_loaded()
-        prompt = self._processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        image_inputs, video_inputs = self._process_vision_info(messages)
+        prompts = [
+            self._processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for messages in messages_batch
+        ]
+        if image_inputs_batch is None:
+            image_inputs, video_inputs = self._process_vision_info(messages_batch)
+        else:
+            image_inputs = [image for request_images in image_inputs_batch for image in request_images]
+            video_inputs = None
         inputs = self._processor(
-            text=[prompt],
-            images=image_inputs,
+            text=prompts,
+            images=image_inputs or None,
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
@@ -56,6 +81,7 @@ class Qwen25VLBackend:
         }
         if do_sample:
             generate_kwargs["temperature"] = temperature
+            generate_kwargs["top_p"] = top_p
         generated_ids = self._model.generate(**inputs, **generate_kwargs)
         generated_ids = [
             output_ids[input_ids.shape[-1]:]
@@ -66,7 +92,7 @@ class Qwen25VLBackend:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        return outputs[0]
+        return outputs
 
     def _ensure_loaded(self) -> None:
         if self._model is not None and self._processor is not None:

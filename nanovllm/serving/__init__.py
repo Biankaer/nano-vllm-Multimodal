@@ -1,5 +1,3 @@
-"""Serving helpers for NanoInfer."""
+"""OpenAI-compatible serving helpers for NanoInfer."""
 
-from nanovllm.serving.engine_client import EngineClient
-
-__all__ = ["EngineClient"]
+__all__: list[str] = []

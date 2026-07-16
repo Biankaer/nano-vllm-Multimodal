@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from nanovllm.multimodal.openai_adapter import adapt_chat_messages
 from nanovllm.serving.engine_client import EngineClient
 from nanovllm.serving.schemas import (
     ChatCompletionChoice,
@@ -40,20 +41,29 @@ def create_openai_router(engine: EngineClient) -> APIRouter:
         if request.stream:
             raise HTTPException(status_code=501, detail="Streaming will be implemented in Phase 2.")
 
-        if _has_image_content(request.messages):
-            qwen_messages = _messages_to_qwen25_vl(request.messages)
+        try:
+            adapted = adapt_chat_messages(
+                request.messages,
+                allow_local_files=engine.config.multimodal_allow_local_files,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if adapted.has_images:
             try:
                 text = engine.generate_multimodal_chat(
-                    qwen_messages,
+                    adapted.multimodal_request,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
+                    top_p=request.top_p,
                 )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             except RuntimeError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         else:
-            prompt = _messages_to_prompt(request.messages)
             outputs = engine.generate(
-                [prompt],
+                [adapted.text_prompt],
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 ignore_eos=request.ignore_eos,
@@ -67,46 +77,3 @@ def create_openai_router(engine: EngineClient) -> APIRouter:
         )
 
     return router
-
-
-def _messages_to_prompt(messages: list[ChatMessage]) -> str:
-    lines: list[str] = []
-    for message in messages:
-        content = message.content
-        if isinstance(content, str):
-            text = content
-        else:
-            text_parts = [part.text for part in content if part.type == "text"]
-            image_count = sum(1 for part in content if part.type == "image_url")
-            text = "\n".join(text_parts)
-            if image_count:
-                text = f"{text}\n[Attached images: {image_count}]".strip()
-        lines.append(f"{message.role}: {text}")
-    lines.append("assistant:")
-    return "\n".join(lines)
-
-
-def _has_image_content(messages: list[ChatMessage]) -> bool:
-    for message in messages:
-        content = message.content
-        if isinstance(content, list) and any(part.type == "image_url" for part in content):
-            return True
-    return False
-
-
-def _messages_to_qwen25_vl(messages: list[ChatMessage]) -> list[dict[str, object]]:
-    qwen_messages: list[dict[str, object]] = []
-    for message in messages:
-        content = message.content
-        if isinstance(content, str):
-            qwen_messages.append({"role": message.role, "content": content})
-            continue
-
-        qwen_content: list[dict[str, object]] = []
-        for part in content:
-            if part.type == "text":
-                qwen_content.append({"type": "text", "text": part.text})
-            elif part.type == "image_url":
-                qwen_content.append({"type": "image", "image": part.image_url.url, "detail": part.image_url.detail})
-        qwen_messages.append({"role": message.role, "content": qwen_content})
-    return qwen_messages
