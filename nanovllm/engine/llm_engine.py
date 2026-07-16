@@ -24,6 +24,7 @@ from nanovllm.engine.sequence import Sequence
 
 # EngineCore 负责请求生命周期、调度和执行编排。
 from nanovllm.engine.engine_core import EngineCore
+from nanovllm.engine.metrics import EngineStepStats, RequestTimingStats, SchedulerStats
 
 
 class LLMEngine:
@@ -103,6 +104,18 @@ class LLMEngine:
         """所有请求是否都已处理完成"""
         # EngineCore 内部 Scheduler 同时没有 waiting 和 running 请求时，整个批次就结束了。
         return self.core.is_finished()
+
+    def scheduler_stats(self) -> SchedulerStats:
+        # 暴露调度器快照，供 serving metrics 和 benchmark 使用。
+        return self.core.scheduler_stats()
+
+    def step_stats(self) -> EngineStepStats | None:
+        # 返回最近一次 step 的性能快照。
+        return self.core.latest_step_stats
+
+    def request_stats(self, seq_id: int) -> RequestTimingStats | None:
+        # 返回已完成请求的生命周期指标。
+        return self.core.request_stats(seq_id)
 
     def generate(
         self,

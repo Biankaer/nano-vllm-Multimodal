@@ -10,6 +10,9 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 # BlockManager 负责分配、释放、复用 KV cache block。
 from nanovllm.engine.block_manager import BlockManager
 
+# SchedulerStats 暴露队列长度和 KV cache 使用情况。
+from nanovllm.engine.metrics import SchedulerStats
+
 
 class Scheduler:
 
@@ -42,6 +45,17 @@ class Scheduler:
     def add(self, seq: Sequence):
         # 新请求先进入 waiting 队列，等待被 prefill。
         self.waiting.append(seq)
+
+    def stats(self) -> SchedulerStats:
+        # 返回调度器当前快照，供 serving metrics 和 benchmark 使用。
+        return SchedulerStats(
+            waiting_seqs=len(self.waiting),
+            running_seqs=len(self.running),
+            total_kv_blocks=len(self.block_manager.blocks),
+            used_kv_blocks=len(self.block_manager.used_block_ids),
+            free_kv_blocks=len(self.block_manager.free_block_ids),
+            prefix_cache_entries=len(self.block_manager.hash_to_block_id),
+        )
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         # 本轮将要送入 ModelRunner 的序列列表。
@@ -97,8 +111,8 @@ class Scheduler:
 
             # 如果本轮之后 prompt 全部进入 KV cache，这条请求就可以转入 decode 阶段。
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                # 标记为 RUNNING。
-                seq.status = SequenceStatus.RUNNING
+                # 标记为 RUNNING，并记录进入 decode 生命周期的时间。
+                seq.mark_running()
 
                 # 从 waiting 队首移除。
                 self.waiting.popleft()
@@ -188,8 +202,8 @@ class Scheduler:
 
             # 如果遇到 EOS，或者生成长度达到 max_tokens，这条序列结束。
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                # 标记完成。
-                seq.status = SequenceStatus.FINISHED
+                # 标记完成并记录完成时间。
+                seq.mark_finished()
 
                 # 释放它占用的 KV cache blocks。
                 self.block_manager.deallocate(seq)

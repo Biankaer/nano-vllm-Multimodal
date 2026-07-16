@@ -109,23 +109,26 @@ Target files:
 
 ### Phase 3: Continuous Batching and Chunked Prefill
 
+Status: metrics foundation implemented.
+
 Deliverables:
 
-- Support dynamic request admission while serving loop is running.
-- Add explicit token budget config.
-- Track TTFT and TPOT per request.
-- Improve long-prompt chunked prefill fairness.
-- Add scheduler metrics.
+- [ ] Support dynamic request admission while serving loop is running.
+- [ ] Add explicit token budget config.
+- [x] Track TTFT and TPOT per request.
+- [ ] Improve long-prompt chunked prefill fairness.
+- [x] Add scheduler metrics.
+- [x] Add per-step prefill/decode metrics.
 
 Metrics:
 
-- TTFT.
-- TPOT.
-- Prefill tokens/s.
-- Decode tokens/s.
-- Queue length.
-- Running sequence count.
-- KV cache free/used blocks.
+- [x] TTFT.
+- [x] TPOT.
+- [x] Prefill tokens/s.
+- [x] Decode seqs/s.
+- [x] Queue length.
+- [x] Running sequence count.
+- [x] KV cache free/used blocks.
 
 ### Phase 4: Speculative Decoding
 

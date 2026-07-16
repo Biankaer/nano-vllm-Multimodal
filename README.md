@@ -18,6 +18,7 @@ Phase 1 has started:
 - Added `/v1/completions` and `/v1/chat/completions` non-streaming endpoints.
 - Added multimodal request, image loading, image feature cache, and processor skeletons.
 - Added the first EngineCore / Executor / GPUWorker split while preserving the original offline API.
+- Added metrics foundation for scheduler state, KV cache usage, per-step throughput, TTFT, TPOT, and request latency.
 
 Architecture notes:
 

@@ -1,6 +1,9 @@
 # copy 用来复制传入的 token_ids，避免外部列表后续修改影响内部状态。
 from copy import copy
 
+# monotonic 用来记录请求生命周期时间，不受系统时间调整影响。
+from time import monotonic
+
 # Enum/auto 用来定义请求状态枚举，状态含义比普通字符串更明确。
 from enum import Enum, auto
 
@@ -9,6 +12,9 @@ from itertools import count
 
 # SamplingParams 提供 temperature、max_tokens、ignore_eos 等生成参数。
 from nanovllm.sampling_params import SamplingParams
+
+# RequestTimingStats 是 EngineCore/benchmark/serving 都能复用的请求级指标。
+from nanovllm.engine.metrics import RequestTimingStats
 
 
 class SequenceStatus(Enum):
@@ -35,6 +41,18 @@ class Sequence:
 
         # 新建请求默认处于 waiting，等待 Scheduler 做 prefill。
         self.status = SequenceStatus.WAITING
+
+        # 请求创建时间，可用于计算排队时间和总延迟。
+        self.arrival_time = monotonic()
+
+        # 请求进入 RUNNING 的时间，通常表示 prompt prefill 完成。
+        self.running_time = None
+
+        # 第一个生成 token 产生的时间，用于计算 TTFT。
+        self.first_token_time = None
+
+        # 请求完成时间，用于计算总延迟和 TPOT。
+        self.finish_time = None
 
         # 保存 prompt token ids 的副本；后续生成 token 会 append 到同一个列表。
         self.token_ids = copy(token_ids)
@@ -68,6 +86,21 @@ class Sequence:
 
         # 是否忽略 EOS token。
         self.ignore_eos = sampling_params.ignore_eos
+
+    def mark_running(self):
+        # 第一次进入 RUNNING 时记录时间；chunked prefill 可能多轮后才运行到这里。
+        if self.running_time is None:
+            self.running_time = monotonic()
+
+        # 更新状态。
+        self.status = SequenceStatus.RUNNING
+
+    def mark_finished(self):
+        # 记录请求完成时间。
+        self.finish_time = monotonic()
+
+        # 更新状态。
+        self.status = SequenceStatus.FINISHED
 
     def __len__(self):
         # len(seq) 返回当前序列总 token 数。
@@ -115,6 +148,10 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        # 第一次 append completion token 时记录首 token 时间。
+        if self.first_token_time is None:
+            self.first_token_time = monotonic()
+
         # 把新采样的 token 追加到序列末尾。
         self.token_ids.append(token_id)
 
@@ -123,6 +160,32 @@ class Sequence:
 
         # 当前序列总长度加 1。
         self.num_tokens += 1
+
+    def timing_stats(self) -> RequestTimingStats:
+        # 排队时间：从请求创建到首次进入 RUNNING。
+        queue_time = self.running_time - self.arrival_time if self.running_time is not None else None
+
+        # TTFT：从请求创建到第一个 completion token 产生。
+        ttft = self.first_token_time - self.arrival_time if self.first_token_time is not None else None
+
+        # 总延迟：从请求创建到请求完成。
+        total_latency = self.finish_time - self.arrival_time if self.finish_time is not None else None
+
+        # TPOT：粗略估算首 token 之后每个 output token 的平均时间。
+        if self.finish_time is not None and self.first_token_time is not None and self.num_completion_tokens > 1:
+            tpot = (self.finish_time - self.first_token_time) / (self.num_completion_tokens - 1)
+        else:
+            tpot = None
+
+        return RequestTimingStats(
+            seq_id=self.seq_id,
+            prompt_tokens=self.num_prompt_tokens,
+            completion_tokens=self.num_completion_tokens,
+            queue_time_sec=queue_time,
+            ttft_sec=ttft,
+            total_latency_sec=total_latency,
+            tpot_sec=tpot,
+        )
 
     def __getstate__(self):
         # 多进程通信会 pickle Sequence；prefill 需要完整 token_ids，decode 只需要 last_token。

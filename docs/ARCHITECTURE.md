@@ -51,6 +51,12 @@ Future responsibilities:
 - Streaming token handoff.
 - TTFT and TPOT measurement.
 
+Current metrics exposed by `EngineCore`:
+
+- `scheduler_stats()`: waiting/running sequence count, KV block usage, prefix cache entries.
+- `latest_step_stats`: last prefill/decode step latency and throughput.
+- `request_stats(seq_id)`: completed request queue time, TTFT, TPOT, and total latency.
+
 ### Executor
 
 Model execution abstraction.
@@ -130,3 +136,28 @@ LLM.generate()
 ```
 
 This preserves behavior while making the engine easier to evolve.
+
+## Metrics Flow
+
+Phase 3 adds a lightweight internal metrics layer:
+
+```text
+Sequence
+  -> records arrival_time / running_time / first_token_time / finish_time
+  -> exposes RequestTimingStats
+
+Scheduler
+  -> exposes SchedulerStats
+  -> reports waiting/running queue sizes
+  -> reports KV cache free/used blocks
+
+EngineCore
+  -> records EngineStepStats after every step
+  -> stores RequestTimingStats for finished sequences
+
+LLMEngine
+  -> exposes scheduler_stats(), step_stats(), request_stats(seq_id)
+```
+
+These stats are intentionally dependency-free. Serving and benchmark modules can
+later export them to Prometheus, JSON benchmark reports, or logs.
