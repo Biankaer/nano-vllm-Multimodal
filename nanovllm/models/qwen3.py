@@ -172,13 +172,19 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("provide exactly one of input_ids or inputs_embeds")
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
+        if residual is None:
+            return self.norm(hidden_states)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -191,6 +197,7 @@ class Qwen3ForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    position_axes = 1
 
     def __init__(
         self,
@@ -204,10 +211,18 @@ class Qwen3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+
+    def embed(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
 
     def compute_logits(
         self,

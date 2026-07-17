@@ -9,6 +9,7 @@ MODEL_PATH = os.environ.get("NANOINFER_MODEL", os.path.expanduser("~/huggingface
 ENFORCE_EAGER = os.environ.get("NANOINFER_ENFORCE_EAGER", "1") not in {"0", "false", "False"}
 TENSOR_PARALLEL_SIZE = int(os.environ.get("NANOINFER_TP_SIZE", "1"))
 MULTIMODAL_MODEL_PATH = os.environ.get("NANOINFER_MM_MODEL")
+MULTIMODAL_BACKEND = os.environ.get("NANOINFER_MM_BACKEND", "native")
 MULTIMODAL_DEVICE_MAP = os.environ.get("NANOINFER_MM_DEVICE_MAP", "auto")
 MULTIMODAL_TORCH_DTYPE = os.environ.get("NANOINFER_MM_DTYPE", "auto")
 MULTIMODAL_ATTN_IMPL = os.environ.get("NANOINFER_MM_ATTN_IMPL") or None
@@ -16,6 +17,9 @@ MULTIMODAL_MAX_BATCH_SIZE = int(os.environ.get("NANOINFER_MM_MAX_BATCH_SIZE", "8
 MULTIMODAL_MAX_IMAGES_PER_BATCH = int(os.environ.get("NANOINFER_MM_MAX_IMAGES_PER_BATCH", "8"))
 MULTIMODAL_BATCH_WAIT_MS = float(os.environ.get("NANOINFER_MM_BATCH_WAIT_MS", "5"))
 MULTIMODAL_CACHE_CAPACITY = int(os.environ.get("NANOINFER_MM_CACHE_CAPACITY", "256"))
+MULTIMODAL_FEATURE_CACHE_BYTES = int(
+    os.environ.get("NANOINFER_MM_FEATURE_CACHE_BYTES", str(2 * 1024**3))
+)
 MULTIMODAL_ALLOW_LOCAL_FILES = os.environ.get("NANOINFER_MM_ALLOW_LOCAL_FILES", "0") in {"1", "true", "True"}
 
 app = create_app(
@@ -23,6 +27,7 @@ app = create_app(
     enforce_eager=ENFORCE_EAGER,
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,
     multimodal_model_path=MULTIMODAL_MODEL_PATH,
+    multimodal_backend=MULTIMODAL_BACKEND,
     multimodal_device_map=MULTIMODAL_DEVICE_MAP,
     multimodal_torch_dtype=MULTIMODAL_TORCH_DTYPE,
     multimodal_attn_implementation=MULTIMODAL_ATTN_IMPL,
@@ -30,5 +35,6 @@ app = create_app(
     multimodal_max_images_per_batch=MULTIMODAL_MAX_IMAGES_PER_BATCH,
     multimodal_batch_wait_ms=MULTIMODAL_BATCH_WAIT_MS,
     multimodal_cache_capacity=MULTIMODAL_CACHE_CAPACITY,
+    multimodal_feature_cache_bytes=MULTIMODAL_FEATURE_CACHE_BYTES,
     multimodal_allow_local_files=MULTIMODAL_ALLOW_LOCAL_FILES,
 )

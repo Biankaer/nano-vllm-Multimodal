@@ -25,6 +25,11 @@ from nanovllm.engine.sequence import Sequence
 # EngineCore 负责请求生命周期、调度和执行编排。
 from nanovllm.engine.engine_core import EngineCore
 from nanovllm.engine.metrics import EngineStepStats, RequestTimingStats, SchedulerStats
+from nanovllm.multimodal.qwen25_vl_processor import (
+    Qwen25VLPromptProcessor,
+    VisionInput,
+)
+from nanovllm.multimodal.runtime import MultimodalPromptMetadata
 
 
 class LLMEngine:
@@ -45,12 +50,18 @@ class LLMEngine:
 
         # 创建引擎配置；Config.__post_init__ 会读取 HuggingFace config。
         config = Config(model, **config_kwargs)
+        self.config = config
 
         # Sequence.block_size 是类变量，所有请求共享同一个 KV cache block 粒度。
         Sequence.block_size = config.kvcache_block_size
 
-        # 加载 tokenizer；use_fast=True 使用 Rust 实现的 fast tokenizer。
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.multimodal_processor = None
+        if getattr(config.hf_config, "model_type", None) == "qwen2_5_vl":
+            self.multimodal_processor = Qwen25VLPromptProcessor.from_pretrained(config.model)
+            self.tokenizer = self.multimodal_processor.tokenizer
+        else:
+            # 加载 tokenizer；use_fast=True 使用 Rust 实现的 fast tokenizer。
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
 
         # 把 EOS token id 写回 config，Scheduler 用它判断生成是否结束。
         config.eos = self.tokenizer.eos_token_id
@@ -69,7 +80,14 @@ class LLMEngine:
             self.core.shutdown()
             del self.core
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        *,
+        multimodal_metadata: MultimodalPromptMetadata | None = None,
+        vision_inputs: tuple[VisionInput, ...] = (),
+    ) -> Sequence:
         """
         向引擎添加一个新的推理请求。
         参数：
@@ -81,10 +99,11 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
 
         # Sequence 是内部请求状态对象，会保存 prompt token、生成 token、KV block table 等。
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, multimodal_metadata)
 
         # 新请求先进入 EngineCore 内部 Scheduler.waiting 队列，等待 prefill。
-        self.core.add_sequence(seq)
+        self.core.add_sequence(seq, vision_inputs)
+        return seq
 
     def step(self):
         """
@@ -117,6 +136,9 @@ class LLMEngine:
         # 返回已完成请求的生命周期指标。
         return self.core.request_stats(seq_id)
 
+    def vision_stats(self):
+        return self.core.vision_stats()
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],
@@ -132,25 +154,80 @@ class LLMEngine:
         返回：
             包含生成的文本和 token_ids 的字典列表
         """
-        # 创建进度条，total 是请求条数；每完成一条请求 update(1)。
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
-
         # 如果传的是单个 SamplingParams，就让所有 prompt 共用同一份采样配置。
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        if len(sampling_params) != len(prompts):
+            raise ValueError("prompts and sampling_params must have the same length")
 
         # 把所有请求转换成 Sequence 并加入 waiting 队列。
+        sequence_ids = []
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            sequence_ids.append(self.add_request(prompt, sp).seq_id)
+
+        return self._drain_sequences(sequence_ids, use_tqdm=use_tqdm)
+
+    def generate_multimodal(
+        self,
+        messages_batch: list[list[dict[str, object]]],
+        images_batch: list[list[object]],
+        details_batch: list[list[str]] | None,
+        sampling_params: SamplingParams | list[SamplingParams],
+        *,
+        use_tqdm: bool = True,
+    ) -> list[dict]:
+        if self.multimodal_processor is None:
+            raise RuntimeError("the loaded model does not support native multimodal prompts")
+        if len(messages_batch) != len(images_batch):
+            raise ValueError("messages_batch and images_batch must have the same length")
+        if details_batch is None:
+            details_batch = [["auto"] * len(images) for images in images_batch]
+        if len(details_batch) != len(messages_batch):
+            raise ValueError("details_batch and messages_batch must have the same length")
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(messages_batch)
+        if len(sampling_params) != len(messages_batch):
+            raise ValueError("requests and sampling_params must have the same length")
+
+        materialized_prompts = [
+            self.multimodal_processor.materialize(messages, images, details)
+            for messages, images, details in zip(
+                messages_batch,
+                images_batch,
+                details_batch,
+            )
+        ]
+        sequence_ids = []
+        for prompt, request_sampling_params in zip(
+            materialized_prompts,
+            sampling_params,
+        ):
+            sequence = self.add_request(
+                list(prompt.token_ids),
+                request_sampling_params,
+                multimodal_metadata=prompt.metadata,
+                vision_inputs=prompt.vision_inputs,
+            )
+            sequence_ids.append(sequence.seq_id)
+        return self._drain_sequences(sequence_ids, use_tqdm=use_tqdm)
+
+    def _drain_sequences(
+        self,
+        sequence_ids: list[int],
+        *,
+        use_tqdm: bool,
+    ) -> list[dict]:
+        pbar = tqdm(total=len(sequence_ids), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
 
         # outputs 暂存已完成请求：key 是 seq_id，value 是 completion token ids。
         outputs = {}
+        remaining = set(sequence_ids)
 
         # 分别记录最近一次 prefill 和 decode 的吞吐。
         prefill_throughput = decode_throughput = 0.
 
         # 主推理循环：只要 Scheduler 里还有请求，就持续 step。
-        while not self.is_finished():
+        while remaining:
             # 记录本轮开始时间。
             t = perf_counter()
 
@@ -173,8 +250,11 @@ class LLMEngine:
 
             # output 只包含本轮新完成的请求。
             for seq_id, token_ids in output:
+                if seq_id not in remaining:
+                    continue
                 # 保存 completion token ids。
                 outputs[seq_id] = token_ids
+                remaining.remove(seq_id)
 
                 # 一条请求完成，进度条加 1。
                 pbar.update(1)
@@ -183,7 +263,7 @@ class LLMEngine:
         pbar.close()
 
         # Sequence.seq_id 按请求加入顺序递增；排序后恢复到用户输入顺序。
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [outputs[seq_id] for seq_id in sequence_ids]
 
         # 把 completion token ids 解码成文本，同时保留 token_ids 方便调试。
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]

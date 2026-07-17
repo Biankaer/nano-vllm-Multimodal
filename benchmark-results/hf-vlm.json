@@ -1,0 +1,52 @@
+{
+  "config": {
+    "server_url": "http://127.0.0.1:8000/v1/chat/completions",
+    "model": "qwen2.5-vl",
+    "num_requests": 100,
+    "concurrency": 8,
+    "image_count": 1,
+    "max_tokens": 64,
+    "temperature": 0.2,
+    "top_p": 1.0
+  },
+  "summary": {
+    "total_requests": 100,
+    "successful_requests": 100,
+    "failed_requests": 0,
+    "wall_time_sec": 432.62315406277776,
+    "request_throughput_per_sec": 0.23114805359097595,
+    "latency_sec": {
+      "avg": 33.23731827648356,
+      "p50": 31.7899660654366,
+      "p90": 40.106059258803725,
+      "p99": 40.83420476384461,
+      "min": 14.25842809304595,
+      "max": 41.06518845632672
+    },
+    "ttft_sec": null,
+    "tpot_sec": null
+  },
+  "errors": [],
+  "server_multimodal_metrics": {
+    "status": "ok",
+    "backend": "hf",
+    "waiting_requests": 0,
+    "submitted_requests": 103,
+    "completed_requests": 103,
+    "failed_requests": 0,
+    "executed_batches": 29,
+    "average_batch_size": 3.5517241379310347,
+    "manager": {
+      "prepared_requests": 103,
+      "prepared_images": 103,
+      "image_asset_cache_entries": 1,
+      "image_asset_cache_hits": 102,
+      "image_asset_cache_misses": 1,
+      "image_asset_cache_evictions": 0,
+      "image_feature_cache_entries": 0,
+      "image_feature_cache_hits": 0,
+      "image_feature_cache_misses": 0,
+      "image_feature_cache_evictions": 0
+    }
+  }
+}

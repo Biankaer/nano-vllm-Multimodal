@@ -1,0 +1,68 @@
+{
+  "config": {
+    "server_url": "http://127.0.0.1:8000/v1/chat/completions",
+    "model": "qwen2.5-vl",
+    "num_requests": 100,
+    "concurrency": 8,
+    "image_count": 1,
+    "max_tokens": 64,
+    "temperature": 0.2,
+    "top_p": 1.0
+  },
+  "summary": {
+    "total_requests": 100,
+    "successful_requests": 100,
+    "failed_requests": 0,
+    "wall_time_sec": 92.8734134119004,
+    "request_throughput_per_sec": 1.076734410056543,
+    "latency_sec": {
+      "avg": 7.088164676837623,
+      "p50": 7.081658037379384,
+      "p90": 7.313599748723209,
+      "p99": 8.172686719242485,
+      "min": 4.553855795413256,
+      "max": 8.180490136146545
+    },
+    "ttft_sec": null,
+    "tpot_sec": null
+  },
+  "errors": [],
+  "server_multimodal_metrics": {
+    "status": "ok",
+    "backend": "native",
+    "batching": {
+      "waiting_requests": 0,
+      "submitted_requests": 103,
+      "completed_requests": 103,
+      "failed_requests": 0,
+      "executed_batches": 29,
+      "average_batch_size": 3.5517241379310347
+    },
+    "image_asset_cache": {
+      "entries": 1,
+      "hits": 102,
+      "misses": 1,
+      "evictions": 0
+    },
+    "vision_feature_cache": {
+      "cache_entries": 1,
+      "cache_resident_bytes": 2727936,
+      "cache_byte_budget": 268435456,
+      "cache_hits": 28,
+      "cache_misses": 1,
+      "cache_evictions": 0,
+      "encoder_batches": 1,
+      "encoded_images": 1,
+      "registered_inputs": 0,
+      "prefix_skipped_features": 0
+    },
+    "scheduler": {
+      "waiting_seqs": 0,
+      "running_seqs": 0,
+      "total_kv_blocks": 7058,
+      "used_kv_blocks": 0,
+      "free_kv_blocks": 7058,
+      "prefix_cache_entries": 2
+    }
+  }
+}

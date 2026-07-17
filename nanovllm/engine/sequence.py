@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # copy 用来复制传入的 token_ids，避免外部列表后续修改影响内部状态。
 from copy import copy
 
@@ -10,11 +12,30 @@ from enum import Enum, auto
 # count 提供一个全局递增计数器，用来给每条 Sequence 分配 seq_id。
 from itertools import count
 
+# dataclass 用来定义不可变的 prefix-cache token 身份。
+from dataclasses import dataclass
+
+# TYPE_CHECKING 让多模态类型只在静态检查时导入，文本引擎不加载 Pillow 等可选依赖。
+from typing import TYPE_CHECKING
+
 # SamplingParams 提供 temperature、max_tokens、ignore_eos 等生成参数。
 from nanovllm.sampling_params import SamplingParams
 
 # RequestTimingStats 是 EngineCore/benchmark/serving 都能复用的请求级指标。
 from nanovllm.engine.metrics import RequestTimingStats
+
+if TYPE_CHECKING:
+    # MultimodalPromptMetadata 保存 MRoPE 位置和视觉 token 的稳定特征身份。
+    from nanovllm.multimodal.runtime import MultimodalPromptMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixCacheToken:
+    # 文本 token 和视觉占位 token 都保留原始 token id。
+    token_id: int
+
+    # 文本 token 为 None；视觉 token 包含图像身份和图像内 feature 下标。
+    multimodal_id: str | None = None
 
 
 class SequenceStatus(Enum):
@@ -35,7 +56,17 @@ class Sequence:
     # 全局递增 id 生成器，保证每条请求都有唯一 seq_id。
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params=SamplingParams()):
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params=SamplingParams(),
+        multimodal_metadata: MultimodalPromptMetadata | None = None,
+    ):
+        if not token_ids:
+            raise ValueError("token_ids cannot be empty")
+        if multimodal_metadata is not None:
+            multimodal_metadata.validate(len(token_ids))
+
         # 给当前请求分配唯一 id；generate 最后用它恢复输出顺序。
         self.seq_id = next(Sequence.counter)
 
@@ -65,6 +96,12 @@ class Sequence:
 
         # prompt token 数固定不变，用它区分 prompt 和 completion。
         self.num_prompt_tokens = len(token_ids)
+
+        # 多模态 prompt 的位置和视觉 span 元数据；不保存大型 feature tensor。
+        self.multimodal_metadata = multimodal_metadata
+
+        # decode token 的 MRoPE 位置为 token 下标加上这个 delta。
+        self.mrope_position_delta = multimodal_metadata.rope_delta if multimodal_metadata is not None else 0
 
         # 已经写入或复用到 KV cache 的 token 数。
         self.num_cached_tokens = 0
@@ -147,6 +184,20 @@ class Sequence:
         # 返回第 i 个逻辑 block 覆盖的 token ids。
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
+    def block_cache_key(self, i: int) -> tuple[PrefixCacheToken, ...]:
+        # cache key 与逻辑 block 使用完全相同的边界。
+        assert 0 <= i < self.num_blocks
+        start = i * self.block_size
+        end = min(start + self.block_size, self.num_tokens)
+
+        cache_tokens = []
+        for token_index in range(start, end):
+            multimodal_id = None
+            if self.multimodal_metadata is not None and token_index < self.num_prompt_tokens:
+                multimodal_id = self.multimodal_metadata.visual_identity_at(token_index)
+            cache_tokens.append(PrefixCacheToken(self.token_ids[token_index], multimodal_id))
+        return tuple(cache_tokens)
+
     def append_token(self, token_id: int):
         # 第一次 append completion token 时记录首 token 时间。
         if self.first_token_time is None:
@@ -191,12 +242,46 @@ class Sequence:
         # 多进程通信会 pickle Sequence；prefill 需要完整 token_ids，decode 只需要 last_token。
         last_state = self.last_token if not self.is_prefill else self.token_ids
 
+        # prefill worker 需要完整 MRoPE 元数据；decode 只传一个整数 delta，避免重复传长 position_ids。
+        multimodal_state = self.multimodal_metadata if self.is_prefill else None
+
         # 返回精简状态，减少 rank 0 向其它 rank 传输的数据量。
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            last_state,
+            multimodal_state,
+            self.mrope_position_delta,
+        )
 
     def __setstate__(self, state):
         # 从 pickle 状态恢复 Sequence 的核心字段。
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        if len(state) == 6:
+            # 兼容旧进程或旧 pickle 中尚未携带多模态状态的格式。
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.num_scheduled_tokens,
+                self.block_table,
+                last_state,
+            ) = state
+            self.multimodal_metadata = None
+            self.mrope_position_delta = 0
+        else:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.num_scheduled_tokens,
+                self.block_table,
+                last_state,
+                self.multimodal_metadata,
+                self.mrope_position_delta,
+            ) = state
 
         # prefill 状态传来的是完整 token_ids。
         if isinstance(last_state, list):

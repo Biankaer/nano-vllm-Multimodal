@@ -4,11 +4,11 @@ from collections import deque
 # xxhash 提供快速非加密哈希，用来为完整 token block 建立 prefix cache key。
 import xxhash
 
-# numpy 用来把 token id 列表转成连续 bytes，方便送进 xxhash。
-import numpy as np
+# Sequence 提供 block identity、num_blocks、block_table 等信息。
+from nanovllm.engine.sequence import PrefixCacheToken, Sequence
 
-# Sequence 提供 block(i)、num_blocks、block_table 等信息。
-from nanovllm.engine.sequence import Sequence
+
+BlockCacheKey = tuple[PrefixCacheToken, ...]
 
 
 class Block:
@@ -23,15 +23,15 @@ class Block:
         # 当前 block 对应 token 内容的 hash；-1 表示尚未写入可复用 hash。
         self.hash = -1
 
-        # 保存这个 block 对应的 token ids，用来在 hash 命中后再次校验，避免哈希碰撞误复用。
-        self.token_ids = []
+        # 保存完整 block identity，用来在 hash 命中后再次校验，避免碰撞或图像误复用。
+        self.cache_key: BlockCacheKey = ()
 
-    def update(self, hash: int, token_ids: list[int]):
+    def update(self, hash: int, cache_key: BlockCacheKey):
         # 写入这个 block 的 prefix hash。
         self.hash = hash
 
-        # 保存完整 block 的 token ids，后续 prefix cache 命中时做精确比较。
-        self.token_ids = token_ids
+        # 保存完整 block identity，后续 prefix cache 命中时做精确比较。
+        self.cache_key = cache_key
 
     def reset(self):
         # 新分配出去的 block 默认由一个 Sequence 引用。
@@ -40,8 +40,8 @@ class Block:
         # 重置 hash，等这个 block 被完整写满后再 hash_blocks。
         self.hash = -1
 
-        # 清空 token ids，避免旧内容被误认为当前内容。
-        self.token_ids = []
+        # 清空旧 identity，避免旧内容被误认为当前内容。
+        self.cache_key = ()
 
 
 class BlockManager:
@@ -63,7 +63,7 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, cache_key: BlockCacheKey, prefix: int = -1):
         # 创建 64-bit xxhash 对象。
         h = xxhash.xxh64()
 
@@ -72,8 +72,14 @@ class BlockManager:
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
 
-        # 将 token ids 转成 bytes 后更新 hash。
-        h.update(np.array(token_ids).tobytes())
+        # 每个 token 都使用固定 8-byte token id 和长度分隔的多模态身份。
+        # 文本 token 的 identity 长度为 0；视觉 token 的 identity 包含图像和 feature 下标。
+        for cache_token in cache_key:
+            h.update(cache_token.token_id.to_bytes(8, "little", signed=True))
+            identity = cache_token.multimodal_id
+            identity_bytes = identity.encode("utf-8") if identity is not None else b""
+            h.update(len(identity_bytes).to_bytes(4, "little"))
+            h.update(identity_bytes)
 
         # 返回整数形式的 hash 值。
         return h.intdigest()
@@ -123,17 +129,17 @@ class BlockManager:
 
         # 只检查到倒数第二个 block：最后一个 block 可能未满，不作为 prefix cache 复用单位。
         for i in range(seq.num_blocks - 1):
-            # 取第 i 个逻辑 block 的 token ids。
-            token_ids = seq.block(i)
+            # 取第 i 个逻辑 block 的完整 cache identity。
+            cache_key = seq.block_cache_key(i)
 
             # 计算带前缀依赖的 hash。
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(cache_key, h)
 
             # 查找这个 prefix hash 是否已经对应某个物理 block。
             block_id = self.hash_to_block_id.get(h, -1)
 
-            # 没命中，或者 hash 命中但 token ids 不一致，就停止 prefix 复用。
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            # 没命中，或者 hash 命中但完整 identity 不一致，就停止 prefix 复用。
+            if block_id == -1 or self.blocks[block_id].cache_key != cache_key:
                 break
 
             # 成功复用一个完整 prefix block。
@@ -159,11 +165,11 @@ class BlockManager:
 
         # 先为可复用的 prefix blocks 填充 block_table。
         for i in range(num_cached_blocks):
-            # 取第 i 个逻辑 block 的 token ids。
-            token_ids = seq.block(i)
+            # 取第 i 个逻辑 block 的完整 cache identity。
+            cache_key = seq.block_cache_key(i)
 
             # 计算该 block 的 prefix hash。
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(cache_key, h)
 
             # 找到已有物理 block。
             block_id = self.hash_to_block_id[h]
@@ -239,14 +245,14 @@ class BlockManager:
             # 找到逻辑 block i 对应的物理 block。
             block = self.blocks[seq.block_table[i]]
 
-            # 取逻辑 block i 的 token ids。
-            token_ids = seq.block(i)
+            # 取逻辑 block i 的完整 cache identity。
+            cache_key = seq.block_cache_key(i)
 
             # 计算包含完整前缀信息的 hash。
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(cache_key, h)
 
-            # 将 hash 和 token ids 写入 block 元数据。
-            block.update(h, token_ids)
+            # 将 hash 和完整 identity 写入 block 元数据。
+            block.update(h, cache_key)
 
             # 建立 hash 到物理 block 的索引，供未来请求做 prefix cache。
             self.hash_to_block_id[h] = block.block_id

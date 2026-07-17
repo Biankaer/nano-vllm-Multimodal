@@ -18,6 +18,7 @@ class MultimodalBackend(Protocol):
         messages_batch: list[list[dict[str, object]]],
         *,
         image_inputs_batch: list[list[object]],
+        image_details_batch: list[list[str]] | None,
         max_new_tokens: int,
         temperature: float,
         top_p: float,
@@ -150,10 +151,15 @@ class MultimodalEngineCore:
 
             try:
                 image_inputs_batch = self.manager.prepare_batch(batch)
+                image_details_batch = [
+                    [image.detail for image in request.request.images]
+                    for request in batch.requests
+                ]
                 first = batch.requests[0]
                 outputs = self.backend.generate_chat_batch(
                     [request.request.messages for request in batch.requests],
                     image_inputs_batch=image_inputs_batch,
+                    image_details_batch=image_details_batch,
                     max_new_tokens=first.max_new_tokens,
                     temperature=first.temperature,
                     top_p=first.top_p,

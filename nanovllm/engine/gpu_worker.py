@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from nanovllm.config import Config
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.sequence import Sequence
+from nanovllm.multimodal.qwen25_vl_processor import VisionInput
 
 
 class GPUWorker:
@@ -22,6 +23,15 @@ class GPUWorker:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         return self.runner.call("run", seqs, is_prefill)
+
+    def register_vision_inputs(self, inputs: tuple[VisionInput, ...]) -> None:
+        self.runner.call("register_vision_inputs", inputs)
+
+    def release_vision_inputs(self, keys: tuple[str, ...]) -> None:
+        self.runner.call("release_vision_inputs", keys)
+
+    def vision_stats(self):
+        return self.runner.call("vision_stats")
 
     def shutdown(self) -> None:
         self.runner.call("exit")

@@ -47,7 +47,12 @@ def main() -> None:
     report["server_multimodal_metrics"] = fetch_server_metrics(args.server_url, args.timeout)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.output_json:
-        Path(args.output_json).write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        write_report(Path(args.output_json), report)
+
+
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
 def parse_args() -> argparse.Namespace:

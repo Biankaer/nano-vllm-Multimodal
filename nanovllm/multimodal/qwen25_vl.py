@@ -38,6 +38,7 @@ class Qwen25VLBackend:
         return self.generate_chat_batch(
             [messages],
             image_inputs_batch=None,
+            image_details_batch=None,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -48,6 +49,7 @@ class Qwen25VLBackend:
         messages_batch: list[list[dict[str, Any]]],
         *,
         image_inputs_batch: list[list[object]] | None,
+        image_details_batch: list[list[str]] | None,
         max_new_tokens: int,
         temperature: float,
         top_p: float = 1.0,

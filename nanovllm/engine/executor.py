@@ -5,6 +5,7 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.engine.gpu_worker import GPUWorker, run_gpu_worker
 from nanovllm.engine.sequence import Sequence
+from nanovllm.multimodal.qwen25_vl_processor import VisionInput
 
 
 class Executor:
@@ -27,6 +28,15 @@ class Executor:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         return self.driver_worker.run(seqs, is_prefill)
+
+    def register_vision_inputs(self, inputs: tuple[VisionInput, ...]) -> None:
+        self.driver_worker.register_vision_inputs(inputs)
+
+    def release_vision_inputs(self, keys: tuple[str, ...]) -> None:
+        self.driver_worker.release_vision_inputs(keys)
+
+    def vision_stats(self):
+        return self.driver_worker.vision_stats()
 
     def shutdown(self) -> None:
         self.driver_worker.shutdown()

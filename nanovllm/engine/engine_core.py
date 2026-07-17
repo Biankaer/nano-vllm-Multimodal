@@ -7,6 +7,7 @@ from nanovllm.engine.executor import Executor
 from nanovllm.engine.metrics import EngineStepStats, RequestTimingStats, SchedulerStats
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence
+from nanovllm.multimodal.qwen25_vl_processor import VisionInput
 
 
 class EngineCore:
@@ -26,8 +27,20 @@ class EngineCore:
         self.latest_step_stats: EngineStepStats | None = None
         self.finished_request_stats: dict[int, RequestTimingStats] = {}
 
-    def add_sequence(self, seq: Sequence) -> None:
-        self.scheduler.add(seq)
+    def add_sequence(
+        self,
+        seq: Sequence,
+        vision_inputs: tuple[VisionInput, ...] = (),
+    ) -> None:
+        feature_keys = tuple(dict.fromkeys(item.feature_key for item in vision_inputs))
+        if vision_inputs:
+            self.executor.register_vision_inputs(vision_inputs)
+        try:
+            self.scheduler.add(seq)
+        except BaseException:
+            if feature_keys:
+                self.executor.release_vision_inputs(feature_keys)
+            raise
 
     def step(self) -> tuple[list[tuple[int, list[int]]], int]:
         started = perf_counter()
@@ -39,6 +52,7 @@ class EngineCore:
         for seq in seqs:
             if seq.is_finished:
                 self.finished_request_stats[seq.seq_id] = seq.timing_stats()
+                self.executor.release_vision_inputs(self._vision_feature_keys(seq))
         self._record_step_stats(
             is_prefill=is_prefill,
             batch_size=len(seqs),
@@ -56,8 +70,18 @@ class EngineCore:
     def request_stats(self, seq_id: int) -> RequestTimingStats | None:
         return self.finished_request_stats.get(seq_id)
 
+    def vision_stats(self):
+        return self.executor.vision_stats()
+
     def shutdown(self) -> None:
         self.executor.shutdown()
+
+    @staticmethod
+    def _vision_feature_keys(seq: Sequence) -> tuple[str, ...]:
+        metadata = seq.multimodal_metadata
+        if metadata is None:
+            return ()
+        return tuple(dict.fromkeys(span.feature_key for span in metadata.visual_spans))
 
     def _record_step_stats(self, *, is_prefill: bool, batch_size: int, scheduled_tokens: int, elapsed_sec: float) -> None:
         self.step_id += 1

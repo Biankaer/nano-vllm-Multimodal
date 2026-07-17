@@ -10,27 +10,25 @@ in serving, multimodal, benchmark, and engine-refactor modules.
 
 ## Current Status
 
-The current implementation spans the serving, engine refactor, metrics, and
-multimodal batching milestones:
+Implemented milestones:
 
-- Added project modification plan: `docs/MODIFICATION_PLAN.md`.
 - Added OpenAI-style serving schema definitions.
 - Added FastAPI app skeleton.
 - Added `/v1/completions` and `/v1/chat/completions` non-streaming endpoints.
 - Added multimodal request, image loading, image feature-cache hook, and processor skeletons.
 - Added the first EngineCore / Executor / GPUWorker split while preserving the original offline API.
 - Added metrics foundation for scheduler state, KV cache usage, per-step throughput, TTFT, TPOT, and request latency.
-- Added a Qwen2.5-VL HuggingFace backend for image-text chat requests.
+- Added a Qwen2.5-VL HuggingFace compatibility backend for explicit fallback.
 - Added an OpenAI-to-Qwen2.5-VL request adapter for URL, base64, file URL, and trusted local-path images.
 - Added engine-owned multimodal request batching, image/text token budgets, and decoded-image LRU caching.
 - Added a concurrent multimodal benchmark with latency percentiles and server-side cache/batch metrics.
-
-Architecture notes:
-
-- [docs/COMPLETE_LEARNING_GUIDE.md](docs/COMPLETE_LEARNING_GUIDE.md)
-- [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/IMPLEMENTATION_RETROSPECTIVE.md](docs/IMPLEMENTATION_RETROSPECTIVE.md)
+- Added the first native-runtime foundation: Qwen2.5-VL MRoPE prompt positions,
+  strict visual embedding replacement, and image-aware paged-KV prefix identities.
+- Added a native Qwen2.5-VL decoder using the same Scheduler, BlockManager,
+  paged KV cache, chunked prefill, sampler, and CUDA execution path as Qwen3.
+- Added a worker-owned, byte-budgeted GPU vision feature LRU with miss
+  micro-batching, pinning, request reference counts, and prefix-cache-aware lazy
+  vision resolution.
 
 ## Roadmap
 
@@ -42,8 +40,6 @@ Planned milestones:
 4. N-gram speculative decoding.
 5. Multimodal VLM serving with image preprocessing, image feature cache, image-text batching, and multimodal benchmarks.
 6. Benchmark reports for TTFT, TPOT, throughput, latency percentiles, KV cache usage, and multimodal overhead.
-
-See [docs/MODIFICATION_PLAN.md](docs/MODIFICATION_PLAN.md) for the full plan.
 
 ## Installation
 
@@ -65,6 +61,13 @@ Multimodal extras:
 pip install -e ".[all]"
 ```
 
+Qwen2.5-VL requires `transformers>=4.51.0`. Check the server environment before
+loading the multimodal model:
+
+```bash
+python -c "import transformers; print(transformers.__version__)"
+```
+
 ## Model Download
 
 ```bash
@@ -84,6 +87,28 @@ outputs = llm.generate(["Hello, NanoInfer."], sampling_params)
 print(outputs[0]["text"])
 ```
 
+Native static-image generation uses the same `LLM` instance:
+
+```python
+from PIL import Image
+from nanovllm import LLM, SamplingParams
+
+llm = LLM("~/huggingface/Qwen2.5-VL-3B-Instruct/", enforce_eager=True)
+messages = [{
+    "role": "user",
+    "content": [
+        {"type": "image"},
+        {"type": "text", "text": "Describe this image."},
+    ],
+}]
+outputs = llm.generate_multimodal(
+    [messages],
+    [[Image.open("assets/logo.png").convert("RGB")]],
+    [["auto"]],
+    SamplingParams(temperature=0.2, max_tokens=64),
+)
+```
+
 ## Serving Usage
 
 Start the server:
@@ -93,17 +118,22 @@ NANOINFER_MODEL=~/huggingface/Qwen3-0.6B/ \
 uvicorn nanovllm.serving.entrypoint:app --host 0.0.0.0 --port 8000
 ```
 
-Start with a Qwen2.5-VL multimodal backend:
+Start the unified native Qwen2.5-VL runtime:
 
 ```bash
-NANOINFER_MODEL=~/huggingface/Qwen3-0.6B/ \
-NANOINFER_MM_MODEL=~/huggingface/Qwen2.5-VL-3B-Instruct/ \
-NANOINFER_MM_DTYPE=bfloat16 \
+NANOINFER_MODEL=~/huggingface/Qwen2.5-VL-3B-Instruct/ \
+NANOINFER_MM_BACKEND=native \
+NANOINFER_MM_FEATURE_CACHE_BYTES=2147483648 \
 NANOINFER_MM_MAX_BATCH_SIZE=8 \
 NANOINFER_MM_BATCH_WAIT_MS=5 \
 NANOINFER_MM_CACHE_CAPACITY=256 \
 uvicorn nanovllm.serving.entrypoint:app --host 0.0.0.0 --port 8000
 ```
+
+Set `NANOINFER_MM_BACKEND=hf` and `NANOINFER_MM_MODEL` to retain the Transformers
+`generate()` compatibility path. Native mode currently supports static images
+on one GPU (`tensor_parallel_size=1`); video and top-p sampling are rejected
+explicitly.
 
 The `image_url.url` field accepts HTTP(S) URLs and base64 data URLs. Multiple
 image and text parts may be interleaved in one message. Trusted deployments can
@@ -180,18 +210,38 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-## Multimodal Direction
+## Native Multimodal Runtime
 
-The first multimodal milestone introduces request schemas and model-agnostic image
-feature caching. The first real VLM backend is Qwen2.5-VL through HuggingFace
-Transformers:
+Native mode owns the full decode path:
 
 ```text
-image + text
-  -> image loader / preprocessing
-  -> Qwen2.5-VL processor
-  -> Qwen2.5-VL model generate
-  -> OpenAI-compatible response
+OpenAI request -> decoded-image LRU -> Qwen processor
+  -> token IDs + 3-axis MRoPE + CPU image patches
+  -> Sequence / MultimodalBatcher / Scheduler
+  -> lazy VisionFeatureProvider resolution
+      -> byte-budgeted GPU feature LRU
+  -> native Qwen2.5 decoder prefill
+  -> image-aware BlockManager + paged KV cache
+  -> native decode + sampler
+```
+
+When paged-KV prefix reuse covers an entire visual span, `ModelRunner` does not
+resolve the image feature at all. If the text prefix differs but the image is
+the same, the GPU feature cache avoids rerunning the vision tower.
+
+Run the CPU-only foundation tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Run the A100 correctness and cache gates with:
+
+```bash
+python verify_qwen25_vl_native.py \
+  --model ~/huggingface/Qwen2.5-VL-3B-Instruct \
+  --image assets/logo.png \
+  --mode all
 ```
 
 Optimization goals:

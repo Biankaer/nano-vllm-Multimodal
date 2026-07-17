@@ -44,6 +44,12 @@ class Config:
     # KV cache 总块数，由 ModelRunner 根据显存动态计算后写入。
     num_kvcache_blocks: int = -1
 
+    # 原生视觉特征缓存按 GPU 常驻字节数限制，而不是按图片条目数限制。
+    vision_feature_cache_bytes: int = 2 * 1024**3
+
+    # 当前 PyTorch/Transformers 组合默认使用兼容性更稳妥的 SDPA 视觉注意力。
+    vision_attn_implementation: str = "sdpa"
+
     def __post_init__(self):
         # 模型必须是本地目录；这个实现不直接支持传 HuggingFace repo id 在线加载。
         assert os.path.isdir(self.model)
@@ -56,6 +62,12 @@ class Config:
 
         # 读取模型结构配置，例如层数、头数、dtype、最大位置长度等。
         self.hf_config = AutoConfig.from_pretrained(self.model)
+
+        if self.vision_feature_cache_bytes <= 0:
+            raise ValueError("vision feature cache byte budget must be positive")
+
+        if getattr(self.hf_config, "model_type", None) == "qwen2_5_vl" and self.tensor_parallel_size != 1:
+            raise ValueError("native Qwen2.5-VL currently requires tensor_parallel_size=1")
 
         # 用户传入的 max_model_len 不能超过模型 config 中声明的最大位置长度。
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

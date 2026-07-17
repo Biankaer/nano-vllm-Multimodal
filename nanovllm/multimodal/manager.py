@@ -41,11 +41,15 @@ class MultimodalManager:
     def prepare_batch(self, batch: MultimodalBatch) -> list[list[object]]:
         prepared: list[list[object]] = []
         for generation_request in batch.requests:
-            request_images = [self._load_cached(image) for image in generation_request.request.images]
+            request_images = self.prepare_images(generation_request.request.images)
             prepared.append(request_images)
-            self.prepared_requests += 1
-            self.prepared_images += len(request_images)
         return prepared
+
+    def prepare_images(self, image_inputs: list[ImageInput]) -> list[object]:
+        images = [self._load_cached(image_input) for image_input in image_inputs]
+        self.prepared_requests += 1
+        self.prepared_images += len(images)
+        return images
 
     def get_image_features(self, cache_key: str) -> object | None:
         return self.feature_cache.get(cache_key)
