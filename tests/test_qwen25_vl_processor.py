@@ -4,7 +4,16 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
-from nanovllm.multimodal.qwen25_vl_processor import Qwen25VLPromptProcessor
+from nanovllm.multimodal.qwen25_vl_processor import (
+    MaterializedQwen25VLPrompt,
+    Qwen25VLPromptProcessor,
+    VisionInput as LegacyVisionInput,
+)
+from nanovllm.multimodal.runtime import (
+    MaterializedMultimodalPrompt,
+    VisionFeatureBundle,
+    VisionInput,
+)
 
 
 class FakeQwenProcessor:
@@ -69,6 +78,18 @@ class Qwen25VLPromptProcessorTests(unittest.TestCase):
         self.assertEqual(result.token_ids, (10, 99, 20, 99, 99, 30))
         result.metadata.validate(len(result.token_ids))
 
+    def test_legacy_types_reexport_common_multimodal_types(self):
+        self.assertIs(LegacyVisionInput, VisionInput)
+        self.assertIs(MaterializedQwen25VLPrompt, MaterializedMultimodalPrompt)
+
+        result = self.processor.materialize(
+            self.messages,
+            [self.image_a, self.image_b],
+            ["auto", "high"],
+        )
+
+        self.assertIsInstance(result, MaterializedMultimodalPrompt)
+
     def test_same_pixels_share_feature_key(self):
         first = self.processor.materialize(
             self.messages,
@@ -112,6 +133,42 @@ class Qwen25VLPromptProcessorTests(unittest.TestCase):
                 [self.image_a, self.image_b],
                 ["auto", "high"],
             )
+
+
+class VisionFeatureBundleTests(unittest.TestCase):
+    def test_validates_layers_and_counts_total_bytes(self):
+        final = torch.zeros(2, 3, dtype=torch.float32)
+        deep = (
+            torch.ones(2, 3, dtype=torch.float16),
+            torch.full((2, 3), 2.0, dtype=torch.float32),
+        )
+
+        bundle = VisionFeatureBundle(final, deep)
+
+        self.assertEqual(bundle.token_count, 2)
+        self.assertEqual(bundle.hidden_size, 3)
+        self.assertEqual(bundle.nbytes, 24 + 12 + 24)
+
+    def test_rejects_non_matrix_and_inconsistent_deepstack_shapes(self):
+        with self.assertRaisesRegex(ValueError, "rank-2"):
+            VisionFeatureBundle(torch.zeros(2, 3, 4))
+        with self.assertRaisesRegex(ValueError, "token and hidden"):
+            VisionFeatureBundle(
+                torch.zeros(2, 3),
+                (torch.zeros(3, 3),),
+            )
+
+    def test_detach_contiguous_and_to_apply_to_every_layer(self):
+        final_source = torch.arange(12.0, requires_grad=True).reshape(3, 4).T
+        deep_source = (final_source + 1,)
+        bundle = VisionFeatureBundle(final_source, deep_source)
+
+        stored = bundle.detach().contiguous().to(dtype=torch.float64)
+
+        for tensor in (stored.final_embedding, *stored.deepstack_embeddings):
+            self.assertFalse(tensor.requires_grad)
+            self.assertTrue(tensor.is_contiguous())
+            self.assertEqual(tensor.dtype, torch.float64)
 
 
 if __name__ == "__main__":

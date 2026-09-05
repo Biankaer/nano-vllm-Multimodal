@@ -46,6 +46,19 @@ class Scheduler:
         # 新请求先进入 waiting 队列，等待被 prefill。
         self.waiting.append(seq)
 
+    def abort(self, seq_id: int) -> Sequence | None:
+        """Remove one sequence and release any allocated KV blocks."""
+        for queue in (self.waiting, self.running):
+            for seq in queue:
+                if seq.seq_id != seq_id:
+                    continue
+                queue.remove(seq)
+                if seq.block_table:
+                    self.block_manager.deallocate(seq)
+                seq.mark_finished("abort")
+                return seq
+        return None
+
     def stats(self) -> SchedulerStats:
         # 返回调度器当前快照，供 serving metrics 和 benchmark 使用。
         return SchedulerStats(
@@ -201,9 +214,11 @@ class Scheduler:
             seq.append_token(token_id)
 
             # 如果遇到 EOS，或者生成长度达到 max_tokens，这条序列结束。
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            reached_eos = not seq.ignore_eos and token_id == self.eos
+            reached_length = seq.num_completion_tokens == seq.max_tokens
+            if reached_eos or reached_length:
                 # 标记完成并记录完成时间。
-                seq.mark_finished()
+                seq.mark_finished("stop" if reached_eos else "length")
 
                 # 释放它占用的 KV cache blocks。
                 self.block_manager.deallocate(seq)

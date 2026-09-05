@@ -25,11 +25,45 @@ def load_model(
     ignore_missing: tuple[str, ...] = (),
 ) -> WeightLoadReport:
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    checkpoint_parameter_aliases = getattr(
+        model,
+        "checkpoint_parameter_aliases",
+        {},
+    )
+    if not isinstance(checkpoint_parameter_aliases, dict):
+        raise TypeError("checkpoint_parameter_aliases must be a dictionary")
     parameters = dict(model.named_parameters())
+    packed_source_names = tuple(packed_modules_mapping)
+    packed_target_names = tuple(
+        packed_name for packed_name, _ in packed_modules_mapping.values()
+    )
+    for alias_name, target_name in checkpoint_parameter_aliases.items():
+        if not isinstance(alias_name, str) or not isinstance(target_name, str):
+            raise TypeError("checkpoint parameter aliases must map strings to strings")
+        if alias_name == target_name:
+            raise ValueError(f"checkpoint parameter alias cannot target itself: {alias_name}")
+        if target_name not in parameters:
+            raise ValueError(
+                f"checkpoint parameter alias target does not exist: {target_name}"
+            )
+        if alias_name in parameters:
+            raise ValueError(
+                f"checkpoint parameter alias shadows a model parameter: {alias_name}"
+            )
+        if any(source_name in alias_name for source_name in packed_source_names):
+            raise ValueError(
+                f"checkpoint parameter alias cannot reference a packed source: {alias_name}"
+            )
+        if any(target in target_name for target in packed_target_names):
+            raise ValueError(
+                f"checkpoint parameter alias cannot target a packed parameter: {target_name}"
+            )
+    alias_target_names = set(checkpoint_parameter_aliases.values())
     selected_checkpoint_weights: set[str] = set()
     loaded_parameters: set[str] = set()
     loaded_packed_shards: dict[str, set[str | int]] = {}
     skipped_checkpoint_weights: list[str] = []
+    loaded_alias_values: dict[str, tuple[str, torch.Tensor]] = {}
 
     for file in sorted(glob(os.path.join(path, "*.safetensors"))):
         with safe_open(file, "pt", "cpu") as f:
@@ -66,14 +100,37 @@ def load_model(
                         shards.add(shard_id)
                         break
                 else:
-                    param = parameters.get(param_name)
+                    target_name = checkpoint_parameter_aliases.get(
+                        param_name,
+                        param_name,
+                    )
+                    param = parameters.get(target_name)
                     if param is None:
                         raise KeyError(f"unknown selected checkpoint weight: {weight_name}")
-                    if param_name in loaded_parameters:
-                        raise ValueError(f"model parameter loaded twice: {param_name}")
+                    loaded_weight = f.get_tensor(weight_name)
+                    previous = loaded_alias_values.get(target_name)
+                    if previous is not None:
+                        previous_name, previous_weight = previous
+                        if (
+                            previous_weight.shape != loaded_weight.shape
+                            or previous_weight.dtype != loaded_weight.dtype
+                            or not torch.equal(previous_weight, loaded_weight)
+                        ):
+                            raise ValueError(
+                                "checkpoint parameter alias values differ: "
+                                f"{previous_name} and {weight_name}"
+                            )
+                        loaded_parameters.add(param_name)
+                        continue
+                    if target_name in loaded_parameters:
+                        raise ValueError(f"model parameter loaded twice: {target_name}")
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name))
-                    loaded_parameters.add(param_name)
+                    weight_loader(param, loaded_weight)
+                    loaded_parameters.add(target_name)
+                    if param_name != target_name:
+                        loaded_parameters.add(param_name)
+                    if target_name in alias_target_names:
+                        loaded_alias_values[target_name] = (weight_name, loaded_weight)
 
     expected_shards_by_packed_name: dict[str, set[str | int]] = {}
     for packed_name, shard_id in packed_modules_mapping.values():

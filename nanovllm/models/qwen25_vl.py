@@ -137,7 +137,13 @@ class Qwen25VLModel(nn.Module):
         positions: torch.Tensor,
         *,
         inputs_embeds: torch.Tensor | None = None,
+        visual_token_rows: torch.Tensor | None = None,
+        deepstack_visual_embeds: tuple[torch.Tensor, ...] = (),
     ) -> torch.Tensor:
+        if deepstack_visual_embeds:
+            raise NotImplementedError(
+                "Qwen2.5-VL does not support DeepStack visual embeddings"
+            )
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("provide exactly one of input_ids or inputs_embeds")
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
@@ -176,8 +182,16 @@ class Qwen25VLForCausalLM(nn.Module):
         positions: torch.Tensor,
         *,
         inputs_embeds: torch.Tensor | None = None,
+        visual_token_rows: torch.Tensor | None = None,
+        deepstack_visual_embeds: tuple[torch.Tensor, ...] = (),
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+        return self.model(
+            input_ids,
+            positions,
+            inputs_embeds=inputs_embeds,
+            visual_token_rows=visual_token_rows,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

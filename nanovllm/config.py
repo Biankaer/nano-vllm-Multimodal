@@ -1,11 +1,61 @@
 # os 用来检查模型路径是否存在。
 import os
+import json
 
 # dataclass 自动生成 __init__、__repr__ 等方法，让配置类保持轻量。
 from dataclasses import dataclass
 
 # AutoConfig 从 HuggingFace 模型目录读取 config.json，得到 hidden_size、层数、头数等结构参数。
 from transformers import AutoConfig
+from nanovllm.multimodal.dependencies import require_transformers_version
+
+
+def read_local_model_type(model_path: str) -> str | None:
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except FileNotFoundError as error:
+        raise ValueError(f"model directory is missing config.json: {model_path}") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"model directory has invalid config.json: {model_path}") from error
+    if not isinstance(config, dict):
+        raise ValueError(f"model directory has invalid config.json object: {model_path}")
+    model_type = config.get("model_type")
+    return model_type if isinstance(model_type, str) else None
+
+
+def effective_text_config(hf_config):
+    text_config = getattr(hf_config, "text_config", None)
+    return text_config if text_config is not None else hf_config
+
+
+def resolve_vision_attn_implementation(model_type: str | None, requested: str) -> str:
+    supported = {"auto", "sdpa", "flash_attention_2"}
+    if requested not in supported:
+        raise ValueError(
+            "vision_attn_implementation must be one of "
+            "'auto', 'sdpa', or 'flash_attention_2'"
+        )
+    if requested != "auto":
+        return requested
+    if model_type == "qwen3_vl":
+        return "flash_attention_2"
+    return "sdpa"
+
+
+def resolve_language_attn_implementation(model_type: str | None, requested: str) -> str:
+    supported = {"auto", "sdpa", "flash_attention_2"}
+    if requested not in supported:
+        raise ValueError(
+            "language_attn_implementation must be one of "
+            "'auto', 'sdpa', or 'flash_attention_2'"
+        )
+    if requested != "auto":
+        if requested == "sdpa" and model_type != "qwen3_vl":
+            raise ValueError("language SDPA is currently implemented only for Qwen3-VL")
+        return requested
+    return "flash_attention_2"
 
 
 # slots=True 会让实例不再使用 __dict__，字段固定，内存更省，也能避免写错字段名。
@@ -47,8 +97,14 @@ class Config:
     # 原生视觉特征缓存按 GPU 常驻字节数限制，而不是按图片条目数限制。
     vision_feature_cache_bytes: int = 2 * 1024**3
 
-    # 当前 PyTorch/Transformers 组合默认使用兼容性更稳妥的 SDPA 视觉注意力。
-    vision_attn_implementation: str = "sdpa"
+    # auto 会按模型类型选择原生视觉注意力后端。
+    vision_attn_implementation: str = "auto"
+
+    # Qwen3-VL 可显式选择 HF-aligned SDPA；默认保留 fused/paged Flash 生产路径。
+    language_attn_implementation: str = "auto"
+
+    # Paged KV data movement backend: PyTorch reference, Triton, or C++/CUDA.
+    paged_kv_backend: str = "auto"
 
     def __post_init__(self):
         # 模型必须是本地目录；这个实现不直接支持传 HuggingFace repo id 在线加载。
@@ -60,14 +116,38 @@ class Config:
         # 简单限制 tensor parallel 规模，避免误传过大的并行数。
         assert 1 <= self.tensor_parallel_size <= 8
 
+        if self.paged_kv_backend not in {"auto", "pytorch", "triton", "cuda"}:
+            raise ValueError(
+                "paged_kv_backend must be one of: auto, pytorch, triton, cuda"
+            )
+
+        local_model_type = read_local_model_type(self.model)
+        if local_model_type == "qwen3_vl":
+            require_transformers_version()
+
         # 读取模型结构配置，例如层数、头数、dtype、最大位置长度等。
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        model_type = getattr(self.hf_config, "model_type", None)
+        text_config = effective_text_config(self.hf_config)
+        self.vision_attn_implementation = resolve_vision_attn_implementation(
+            model_type,
+            self.vision_attn_implementation,
+        )
+        self.language_attn_implementation = resolve_language_attn_implementation(
+            model_type,
+            self.language_attn_implementation,
+        )
+
+        if self.language_attn_implementation == "sdpa" and not self.enforce_eager:
+            raise ValueError("language SDPA currently requires enforce_eager=True")
 
         if self.vision_feature_cache_bytes <= 0:
             raise ValueError("vision feature cache byte budget must be positive")
 
-        if getattr(self.hf_config, "model_type", None) == "qwen2_5_vl" and self.tensor_parallel_size != 1:
-            raise ValueError("native Qwen2.5-VL currently requires tensor_parallel_size=1")
+        if model_type in {"qwen2_5_vl", "qwen3_vl"} and self.tensor_parallel_size != 1:
+            raise ValueError(
+                f"native {model_type} currently requires tensor_parallel_size=1"
+            )
 
         # 用户传入的 max_model_len 不能超过模型 config 中声明的最大位置长度。
-        self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        self.max_model_len = min(self.max_model_len, text_config.max_position_embeddings)

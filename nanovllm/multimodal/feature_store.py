@@ -8,6 +8,8 @@ from typing import Iterator
 
 import torch
 
+from nanovllm.multimodal.runtime import VisionFeatureBundle
+
 
 @dataclass(frozen=True, slots=True)
 class VisionFeatureStoreStats:
@@ -21,7 +23,7 @@ class VisionFeatureStoreStats:
 
 @dataclass(slots=True)
 class _FeatureEntry:
-    tensor: torch.Tensor
+    value: VisionFeatureBundle | torch.Tensor
     nbytes: int
     pin_count: int = 0
 
@@ -38,7 +40,7 @@ class VisionFeatureStore:
         self._evictions = 0
         self._lock = RLock()
 
-    def get(self, key: str) -> torch.Tensor | None:
+    def get(self, key: str) -> VisionFeatureBundle | torch.Tensor | None:
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
@@ -46,56 +48,33 @@ class VisionFeatureStore:
                 return None
             self._entries.move_to_end(key)
             self._hits += 1
-            return entry.tensor
+            return entry.value
 
-    def peek(self, key: str) -> torch.Tensor | None:
+    def peek(self, key: str) -> VisionFeatureBundle | torch.Tensor | None:
         with self._lock:
             entry = self._entries.get(key)
-            return entry.tensor if entry is not None else None
+            return entry.value if entry is not None else None
 
-    def put(self, key: str, tensor: torch.Tensor) -> None:
-        if not key:
-            raise ValueError("feature cache key cannot be empty")
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError("feature cache values must be tensors")
-        stored = tensor.detach().contiguous()
-        nbytes = stored.numel() * stored.element_size()
+    def put(self, key: str, value: VisionFeatureBundle | torch.Tensor) -> None:
+        self.put_many({key: value})
 
-        with self._lock:
-            previous = self._entries.get(key)
-            if previous is not None and previous.pin_count:
-                raise RuntimeError(f"cannot replace pinned feature entry: {key}")
-            if previous is not None:
-                self.resident_bytes -= previous.nbytes
-                del self._entries[key]
-
-            required = self.resident_bytes + nbytes
-            self._entries[key] = _FeatureEntry(stored, nbytes)
-            self.resident_bytes = required
-            self._evict_to_budget(protected_key=key)
-            if self.resident_bytes > self.byte_budget:
-                del self._entries[key]
-                self.resident_bytes -= nbytes
-                if previous is not None:
-                    self._entries[key] = previous
-                    self.resident_bytes += previous.nbytes
-                raise MemoryError(
-                    "vision feature cache budget exceeded: "
-                    f"required={required}, budget={self.byte_budget}"
-                )
-
-    def put_many(self, tensors: dict[str, torch.Tensor]) -> None:
+    def put_many(
+        self,
+        values: dict[str, VisionFeatureBundle | torch.Tensor],
+    ) -> None:
         prepared: OrderedDict[str, _FeatureEntry] = OrderedDict()
-        for key, tensor in tensors.items():
+        for key, value in values.items():
             if not key:
                 raise ValueError("feature cache key cannot be empty")
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError("feature cache values must be tensors")
-            stored = tensor.detach().contiguous()
-            prepared[key] = _FeatureEntry(
-                tensor=stored,
-                nbytes=stored.numel() * stored.element_size(),
-            )
+            if isinstance(value, torch.Tensor):
+                stored = value.detach().contiguous()
+                nbytes = stored.numel() * stored.element_size()
+            elif isinstance(value, VisionFeatureBundle):
+                stored = value.detach().contiguous()
+                nbytes = stored.nbytes
+            else:
+                raise TypeError("feature cache values must be vision bundles or tensors")
+            prepared[key] = _FeatureEntry(value=stored, nbytes=nbytes)
 
         working_set_bytes = sum(entry.nbytes for entry in prepared.values())
         if working_set_bytes > self.byte_budget:
@@ -141,7 +120,10 @@ class VisionFeatureStore:
             self._evictions += len(victims)
 
     @contextmanager
-    def pin(self, keys: tuple[str, ...]) -> Iterator[dict[str, torch.Tensor]]:
+    def pin(
+        self,
+        keys: tuple[str, ...],
+    ) -> Iterator[dict[str, VisionFeatureBundle | torch.Tensor]]:
         unique_keys = tuple(dict.fromkeys(keys))
         with self._lock:
             missing = [key for key in unique_keys if key not in self._entries]
@@ -150,7 +132,7 @@ class VisionFeatureStore:
             for key in unique_keys:
                 self._entries[key].pin_count += 1
                 self._entries.move_to_end(key)
-            tensors = {key: self._entries[key].tensor for key in unique_keys}
+            tensors = {key: self._entries[key].value for key in unique_keys}
         try:
             yield tensors
         finally:

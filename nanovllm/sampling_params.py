@@ -5,7 +5,7 @@ from dataclasses import dataclass
 # slots=True 固定字段集合，减少对象开销，也避免运行时随手加不存在的字段。
 @dataclass(slots=True)
 class SamplingParams:
-    # 采样温度。越低越保守，越高越随机；这里不允许接近 0 的 greedy 模式。
+    # 采样温度。0 表示 greedy；正值越低越保守，越高越随机。
     temperature: float = 1.0
 
     # 每条请求最多生成多少个新 token，不包含 prompt 本身。
@@ -15,5 +15,5 @@ class SamplingParams:
     ignore_eos: bool = False
 
     def __post_init__(self):
-        # 这个简化实现只支持随机采样，不支持 temperature=0 的贪心解码。
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        if self.temperature < 0:
+            raise ValueError("temperature cannot be negative")

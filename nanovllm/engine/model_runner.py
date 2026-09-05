@@ -1,5 +1,6 @@
 # pickle 用来把方法名和参数序列化到共享内存，供 tensor parallel 子进程读取。
 import pickle
+from contextlib import suppress
 from dataclasses import dataclass
 
 # torch 是模型执行、张量创建、CUDA graph、显存查询的核心依赖。
@@ -15,7 +16,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 # Config 保存模型路径、并行规模、KV cache 参数等全局配置。
-from nanovllm.config import Config
+from nanovllm.config import Config, effective_text_config
 
 # Sequence 是单条请求的内部状态，ModelRunner 会读取它的 token、block_table 等。
 from nanovllm.engine.sequence import Sequence
@@ -23,11 +24,19 @@ from nanovllm.engine.sequence import Sequence
 # 原生语言模型实现；Qwen2.5-VL 的视觉塔由独立 provider 持有。
 from nanovllm.models.qwen25_vl import Qwen25VLForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.multimodal.qwen25_vl_processor import VisionInput
+from nanovllm.models.qwen3_vl import Qwen3VLForCausalLM
+from nanovllm.models.qwen_vl_adapter import resolve_qwen_vl_adapter
+from nanovllm.multimodal.runtime import VisionFeatureBundle, VisionInput
 from nanovllm.multimodal.vision_provider import VisionFeatureProvider
 
 # Sampler 根据 logits 和 temperature 采样下一个 token。
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.paged_kv import (
+    PagedKVAllocation,
+    create_paged_kv_backend,
+    resolve_paged_kv_backend_name,
+)
+from nanovllm.layers.paged_kv.loader import cuda_extension_buildable
 
 # context 是一个轻量全局上下文，attention/lm_head 会从这里读取本轮执行信息。
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -37,9 +46,10 @@ from nanovllm.utils.loader import load_model
 
 
 def resolve_model_dtype(hf_config) -> torch.dtype:
-    dtype = getattr(hf_config, "dtype", None)
+    text_config = effective_text_config(hf_config)
+    dtype = getattr(text_config, "dtype", None)
     if dtype is None:
-        dtype = getattr(hf_config, "torch_dtype", None)
+        dtype = getattr(text_config, "torch_dtype", None)
     if not isinstance(dtype, torch.dtype):
         raise TypeError(f"model config must define a torch dtype, got {dtype!r}")
     return dtype
@@ -69,6 +79,15 @@ def calculate_num_kvcache_blocks(
     return available_bytes // block_bytes
 
 
+def prepare_sampling_inputs(
+    temperatures: list[float],
+) -> tuple[torch.Tensor, bool]:
+    return (
+        torch.tensor(temperatures, dtype=torch.float32, device="cpu"),
+        all(temperature == 0 for temperature in temperatures),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class VisualReplacement:
     output_row: int
@@ -81,6 +100,15 @@ class VisualReplacementPlan:
     replacements: tuple[VisualReplacement, ...]
     required_feature_keys: tuple[str, ...]
     prefix_skipped_features: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedVisualEmbeddings:
+    """Embedding payload assembled using one visual replacement plan."""
+
+    final_embedding: torch.Tensor
+    deepstack_embeddings: tuple[torch.Tensor, ...]
+    visual_rows: torch.Tensor
 
 
 def plan_visual_replacements(seqs: list[Sequence]) -> VisualReplacementPlan:
@@ -115,6 +143,11 @@ def plan_visual_replacements(seqs: list[Sequence]) -> VisualReplacementPlan:
                     )
         packed_row_start += seq.num_scheduled_tokens
 
+    output_rows = [replacement.output_row for replacement in replacements]
+    if any(left >= right for left, right in zip(output_rows, output_rows[1:])):
+        raise ValueError("visual output rows must be strictly increasing and unique")
+    if output_rows and (output_rows[0] < 0 or output_rows[-1] >= packed_row_start):
+        raise ValueError("visual output rows must be within packed prefill range")
     return VisualReplacementPlan(
         replacements=tuple(replacements),
         required_feature_keys=tuple(required_feature_keys),
@@ -125,37 +158,136 @@ def plan_visual_replacements(seqs: list[Sequence]) -> VisualReplacementPlan:
 def merge_planned_visual_embeddings(
     token_embeddings: torch.Tensor,
     plan: VisualReplacementPlan,
-    features: dict[str, torch.Tensor],
+    features: dict[str, VisionFeatureBundle | torch.Tensor],
 ) -> torch.Tensor:
+    return build_planned_visual_embeddings(
+        token_embeddings,
+        plan,
+        features,
+    ).final_embedding
+
+
+def build_planned_visual_embeddings(
+    token_embeddings: torch.Tensor,
+    plan: VisualReplacementPlan,
+    features: dict[str, VisionFeatureBundle | torch.Tensor],
+) -> PlannedVisualEmbeddings:
     if token_embeddings.ndim != 2:
         raise ValueError("token embeddings must have shape [tokens, hidden_size]")
     if not plan.replacements:
-        return token_embeddings
+        return PlannedVisualEmbeddings(
+            final_embedding=token_embeddings,
+            deepstack_embeddings=(),
+            visual_rows=torch.empty(
+                0,
+                dtype=torch.int64,
+                device=token_embeddings.device,
+            ),
+        )
 
     token_count, hidden_size = token_embeddings.shape
-    for replacement in plan.replacements:
-        feature = features.get(replacement.feature_key)
-        if feature is None:
-            raise KeyError(f"missing visual feature: {replacement.feature_key}")
-        if feature.ndim != 2 or feature.shape[1] != hidden_size:
-            raise ValueError(
-                "visual feature hidden size mismatch: "
-                f"feature={tuple(feature.shape)}, hidden_size={hidden_size}"
-            )
+    bundles: dict[str, VisionFeatureBundle] = {}
+    grouped_replacements: dict[str, list[tuple[int, VisualReplacement]]] = {}
+    deepstack_layer_count: int | None = None
+    for replacement_index, replacement in enumerate(plan.replacements):
+        grouped_replacements.setdefault(replacement.feature_key, []).append(
+            (replacement_index, replacement)
+        )
+        feature = bundles.get(replacement.feature_key)
+        if feature is not None:
+            final_embedding = feature.final_embedding
+        else:
+            feature = features.get(replacement.feature_key)
+            if feature is None:
+                raise KeyError(f"missing visual feature: {replacement.feature_key}")
+            if isinstance(feature, torch.Tensor):
+                feature = VisionFeatureBundle(feature)
+            if not isinstance(feature, VisionFeatureBundle):
+                raise TypeError(
+                    f"visual feature must be a bundle: {replacement.feature_key}"
+                )
+            bundles[replacement.feature_key] = feature
+            final_embedding = feature.final_embedding
+            if final_embedding.shape[1] != hidden_size:
+                raise ValueError(
+                    "visual feature hidden size mismatch: "
+                    f"feature={tuple(final_embedding.shape)}, hidden_size={hidden_size}"
+                )
+            layer_count = len(feature.deepstack_embeddings)
+            if deepstack_layer_count is None:
+                deepstack_layer_count = layer_count
+            elif deepstack_layer_count != layer_count:
+                raise ValueError(
+                    "visual features must have the same deepstack layer count"
+                )
         if not 0 <= replacement.output_row < token_count:
             raise IndexError(f"visual output row is out of range: {replacement.output_row}")
-        if not 0 <= replacement.feature_row < feature.shape[0]:
+        if not 0 <= replacement.feature_row < final_embedding.shape[0]:
             raise IndexError(
                 "visual feature row is out of range: "
                 f"key={replacement.feature_key}, row={replacement.feature_row}"
             )
 
     merged = token_embeddings.clone()
-    for replacement in plan.replacements:
-        merged[replacement.output_row] = features[replacement.feature_key][
-            replacement.feature_row
-        ].to(device=merged.device, dtype=merged.dtype)
-    return merged
+    replacement_count = len(plan.replacements)
+    deepstack_embeddings = tuple(
+        torch.empty(
+            (replacement_count, hidden_size),
+            device=merged.device,
+            dtype=merged.dtype,
+        )
+        for _ in range(deepstack_layer_count or 0)
+    )
+    for feature_key, grouped in grouped_replacements.items():
+        bundle = bundles[feature_key]
+        output_rows = torch.tensor(
+            [replacement.output_row for _, replacement in grouped],
+            dtype=torch.int64,
+            device=merged.device,
+        )
+        feature_rows = torch.tensor(
+            [replacement.feature_row for _, replacement in grouped],
+            dtype=torch.int64,
+            device=bundle.final_embedding.device,
+        )
+        selected_final = bundle.final_embedding.index_select(0, feature_rows).to(
+            device=merged.device,
+            dtype=merged.dtype,
+        )
+        merged.index_copy_(0, output_rows, selected_final)
+
+        visual_output_rows = torch.tensor(
+            [replacement_index for replacement_index, _ in grouped],
+            dtype=torch.int64,
+            device=merged.device,
+        )
+        for layer_index, embedding in enumerate(bundle.deepstack_embeddings):
+            layer_feature_rows = torch.tensor(
+                [replacement.feature_row for _, replacement in grouped],
+                dtype=torch.int64,
+                device=embedding.device,
+            )
+            selected_deepstack = embedding.index_select(
+                0,
+                layer_feature_rows,
+            ).to(
+                device=merged.device,
+                dtype=merged.dtype,
+            )
+            deepstack_embeddings[layer_index].index_copy_(
+                0,
+                visual_output_rows,
+                selected_deepstack,
+            )
+    return PlannedVisualEmbeddings(
+        final_embedding=merged,
+        deepstack_embeddings=deepstack_embeddings,
+        visual_rows=torch.tensor(
+            [replacement.output_row for replacement in plan.replacements],
+            dtype=torch.int64,
+            device=merged.device,
+        ),
+    )
 
 
 def build_prefill_position_rows(
@@ -229,97 +361,151 @@ class ModelRunner:
         # rank 0 持有 Event 列表，其它 rank 持有自己的 Event。
         self.event = event
 
-        # 初始化 NCCL 进程组；所有 rank 都连接到同一个 TCP 地址。
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-
-        # 当前 rank 使用同编号 CUDA 设备。
-        torch.cuda.set_device(rank)
-
-        # 保存原始默认 dtype，初始化结束后恢复。
         default_dtype = torch.get_default_dtype()
+        default_device = torch.get_default_device()
+        self._exited = False
+        process_group_created = False
+        try:
+            # 初始化 NCCL 进程组；所有 rank 都连接到同一个 TCP 地址。
+            dist.init_process_group(
+                "nccl", "tcp://localhost:2333",
+                world_size=self.world_size, rank=rank,
+            )
+            process_group_created = True
+            torch.cuda.set_device(rank)
+            try:
+                torch.set_default_dtype(self.model_dtype)
+                torch.set_default_device("cuda")
+                self._initialize_runtime(hf_config)
+            finally:
+                # Restore before a non-zero rank enters its long-lived worker loop.
+                torch.set_default_device(default_device)
+                torch.set_default_dtype(default_dtype)
+            self._initialize_parallel_runtime()
+        except BaseException:
+            self._cleanup_failed_initialization(process_group_created)
+            raise
 
-        # 将默认 dtype 切到模型 config 的 dtype，后续创建参数会用这个 dtype。
-        torch.set_default_dtype(self.model_dtype)
-
-        # 将默认设备切到 cuda，后续创建模型参数会直接在 GPU 上。
-        torch.set_default_device("cuda")
-
+    def _initialize_runtime(self, hf_config) -> None:
+        requested_paged_backend = getattr(
+            self.config, "paged_kv_backend", "triton"
+        )
+        self.paged_kv_backend_name = resolve_paged_kv_backend_name(
+            requested_paged_backend,
+            cuda_available=torch.cuda.is_available(),
+            cuda_extension_available=cuda_extension_buildable(),
+        )
+        self.paged_kv_backend = create_paged_kv_backend(
+            self.paged_kv_backend_name
+        )
         model_type = getattr(hf_config, "model_type", None)
         self.vision_provider = None
         if model_type == "qwen3":
             self.model = Qwen3ForCausalLM(hf_config)
-            load_model(self.model, config.model)
-        elif model_type == "qwen2_5_vl":
-            self.model = Qwen25VLForCausalLM(hf_config)
-            load_model(self.model, config.model, include_prefixes=("model.",))
-            self.vision_provider = VisionFeatureProvider.from_pretrained(
-                config.model,
-                byte_budget=config.vision_feature_cache_bytes,
+            load_model(self.model, self.config.model)
+        elif model_type in {"qwen2_5_vl", "qwen3_vl"}:
+            adapter = resolve_qwen_vl_adapter(hf_config)
+            if model_type == "qwen3_vl":
+                adapter.audit_checkpoint(self.config.model)
+            language_model_class = (
+                Qwen25VLForCausalLM if model_type == "qwen2_5_vl"
+                else Qwen3VLForCausalLM
+            )
+            language_kwargs = (
+                {"attention_backend": getattr(
+                    self.config,
+                    "language_attn_implementation",
+                    "flash_attention_2",
+                )}
+                if model_type == "qwen3_vl"
+                else {}
+            )
+            self.model = adapter.create_language_model(
+                language_model_class, **language_kwargs
+            )
+            adapter.load_language_weights(self.model, self.config.model)
+            self.vision_provider = adapter.create_vision_provider(
+                self.config.model,
+                byte_budget=self.config.vision_feature_cache_bytes,
                 dtype=self.model_dtype,
-                device=torch.device("cuda", rank),
-                attn_implementation=config.vision_attn_implementation,
+                device=torch.device("cuda", self.rank),
+                attn_implementation=self.config.vision_attn_implementation,
             )
         else:
             raise ValueError(f"unsupported native model type: {model_type!r}")
 
-        # 创建采样器，只有 rank 0 会真正用采样结果。
         self.sampler = Sampler()
-
-        # 先跑一次 warmup，触发 CUDA kernel 初始化并统计峰值显存。
         self.warmup_model()
-
-        # 根据剩余显存分配 KV cache，并把每层 Attention 的 k_cache/v_cache 指向对应切片。
         self.allocate_kv_cache()
-
-        # 如果不强制 eager，就为 decode 阶段捕获一组不同 batch size 的 CUDA graph。
         if not self.enforce_eager:
             self.capture_cudagraph()
 
-        # 初始化完成后把默认设备恢复到 CPU，避免外部不小心创建 CUDA 张量。
-        torch.set_default_device("cpu")
-
-        # 恢复默认 dtype。
-        torch.set_default_dtype(default_dtype)
-
-        # tensor_parallel_size > 1 时，需要建立共享内存通信。
+    def _initialize_parallel_runtime(self) -> None:
         if self.world_size > 1:
-            # rank 0 创建共享内存，负责写入要调用的方法和参数。
-            if rank == 0:
+            if self.rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
-
-            # 非 rank 0 打开同名共享内存，然后进入 loop 等待 rank 0 命令。
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def _cleanup_failed_initialization(self, process_group_created: bool) -> None:
+        shared_memory = getattr(self, "shm", None)
+        if shared_memory is not None:
+            with suppress(BaseException):
+                shared_memory.close()
+            if self.rank == 0:
+                with suppress(BaseException):
+                    shared_memory.unlink()
+            del self.shm
+        for attribute in (
+            "vision_provider", "model", "sampler", "kv_cache",
+            "kv_cache_allocation", "paged_kv_cache_owner",
+            "paged_kv_backend", "graphs", "graph_pool",
+        ):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+        with suppress(BaseException):
+            torch.cuda.empty_cache()
+        if process_group_created:
+            with suppress(BaseException):
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+
     def exit(self):
-        if self.vision_provider is not None:
+        if getattr(self, "_exited", False):
+            return
+        self._exited = True
+        if getattr(self, "vision_provider", None) is not None:
             del self.vision_provider
             self.vision_provider = None
 
         # 多卡时需要关闭共享内存。
         if self.world_size > 1:
             # 当前进程关闭共享内存句柄。
-            self.shm.close()
+            shared_memory = getattr(self, "shm", None)
+            if shared_memory is not None:
+                shared_memory.close()
 
-            # 等待所有 rank 都关闭句柄。
-            dist.barrier()
+                # 等待所有 rank 都关闭句柄。
+                dist.barrier()
 
-            # 只有创建者 rank 0 负责 unlink 共享内存对象。
-            if self.rank == 0:
-                self.shm.unlink()
+                # 只有创建者 rank 0 负责 unlink 共享内存对象。
+                if self.rank == 0:
+                    shared_memory.unlink()
+                self.shm = None
 
         # 如果捕获过 CUDA graph，显式删除相关对象。
-        if not self.enforce_eager:
+        if not self.enforce_eager and hasattr(self, "graphs"):
             del self.graphs, self.graph_pool
 
         # 等待当前设备所有 CUDA 工作完成。
         torch.cuda.synchronize()
 
         # 销毁 NCCL 进程组。
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         # 非 rank 0 子进程常驻循环，等待 rank 0 通过共享内存发命令。
@@ -418,7 +604,7 @@ class ModelRunner:
         config = self.config
 
         # 读取模型结构配置。
-        hf_config = config.hf_config
+        text_config = effective_text_config(config.hf_config)
 
         # 查询当前 GPU 空闲显存和总显存。
         free, total = torch.cuda.mem_get_info()
@@ -433,14 +619,18 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         # 当前 rank 持有的 KV heads 数；tensor parallel 会按 rank 切分 KV heads。
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = text_config.num_key_value_heads // self.world_size
 
         # head_dim 可能在 config 中显式给出，否则用 hidden_size / num_attention_heads。
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        head_dim = getattr(
+            text_config,
+            "head_dim",
+            text_config.hidden_size // text_config.num_attention_heads,
+        )
 
         # 一个 KV block 的字节数：
         # 2 表示 K 和 V；每层都有一份；每块 block_size 个 token；每 token 有 kv_heads * head_dim。
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
+        block_bytes = 2 * text_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
 
         # 估算能分配多少 KV blocks。
         # total * utilization 是目标可用显存；减去当前使用和 warmup 额外峰值，再除以单块大小。
@@ -464,7 +654,26 @@ class ModelRunner:
 
         # 分配总 KV cache 张量，形状：
         # [2(K/V), layers, num_blocks, block_size, local_kv_heads, head_dim]
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        cache_shape = (
+            2,
+            text_config.num_hidden_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+        )
+        backend = getattr(self, "paged_kv_backend", None)
+        if backend is None:
+            cache_tensor = torch.empty(*cache_shape)
+            self.kv_cache_allocation = PagedKVAllocation(cache_tensor)
+        else:
+            self.kv_cache_allocation = backend.allocate(
+                cache_shape,
+                dtype=self.model_dtype,
+                device=torch.device("cuda", self.rank),
+            )
+        self.kv_cache = self.kv_cache_allocation.tensor
+        self.paged_kv_cache_owner = self.kv_cache_allocation.owner
 
         # layer_id 用来把大 KV cache 的每层切片挂到对应 Attention 模块。
         layer_id = 0
@@ -473,6 +682,8 @@ class ModelRunner:
         for module in self.model.modules():
             # Attention 模块初始化时有 k_cache 和 v_cache 占位张量。
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                if backend is not None and hasattr(module, "paged_kv_backend"):
+                    module.paged_kv_backend = backend
                 # 当前层的 K cache 指向总 cache 的对应层切片。
                 module.k_cache = self.kv_cache[0, layer_id]
 
@@ -494,6 +705,24 @@ class ModelRunner:
 
         # 返回形状 [batch, max_num_blocks] 的 block table。
         return block_tables
+
+    def copy_slot_mapping_to_device(self, slot_mapping: list[int]) -> torch.Tensor:
+        host_slots = torch.tensor(
+            slot_mapping,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        allocation = getattr(self, "kv_cache_allocation", None)
+        if (
+            getattr(self.paged_kv_backend, "name", None) == "cuda"
+            and allocation is not None
+        ):
+            return self.paged_kv_backend.copy_slots_async(
+                allocation,
+                host_slots,
+            )
+        return host_slots.cuda(non_blocking=True)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         # 拼接后的输入 token ids，多个序列会被展平成一维。
@@ -519,6 +748,8 @@ class ModelRunner:
 
         # slot_mapping 记录每个新算 token 的 K/V 应写入 KV cache 的哪个物理 slot。
         slot_mapping = []
+        full_context_lens = []
+        query_start_lens = []
 
         # prefix cache 场景需要 block_tables；普通 prefill 不需要。
         block_tables = None
@@ -536,6 +767,8 @@ class ModelRunner:
 
             # seqlen_k 是当前 token 能看到的上下文长度；prefill 中等于 end。
             seqlen_k = end
+            full_context_lens.append(seq.num_prompt_tokens)
+            query_start_lens.append(start)
 
             # 加入本轮真正要送入模型的 token ids。
             input_ids.extend(seq[start:end])
@@ -595,6 +828,8 @@ class ModelRunner:
             positions = positions[0]
 
         inputs_embeds = None
+        visual_token_rows = None
+        deepstack_visual_embeds: tuple[torch.Tensor, ...] = ()
         if replacement_plan.prefix_skipped_features:
             if self.vision_provider is None:
                 raise RuntimeError("multimodal prefix metadata requires a vision provider")
@@ -608,11 +843,14 @@ class ModelRunner:
             with self.vision_provider.resolve_pinned(
                 replacement_plan.required_feature_keys
             ) as features:
-                inputs_embeds = merge_planned_visual_embeddings(
+                visual_payload = build_planned_visual_embeddings(
                     token_embeddings,
                     replacement_plan,
                     features,
                 )
+                inputs_embeds = visual_payload.final_embedding
+                visual_token_rows = visual_payload.visual_rows
+                deepstack_visual_embeds = visual_payload.deepstack_embeddings
 
         # 将 query 累计长度拷贝到 GPU。
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -621,12 +859,35 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         # 将 KV cache 写入位置拷贝到 GPU。
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = self.copy_slot_mapping_to_device(slot_mapping)
 
         # 设置全局上下文，Attention 和 LM head 会从 get_context() 读取这些信息。
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        full_context_lens = torch.tensor(
+            full_context_lens, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        query_start_lens = torch.tensor(
+            query_start_lens, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            full_context_lens,
+            query_start_lens,
+        )
 
-        return input_ids, positions, inputs_embeds
+        return (
+            input_ids,
+            positions,
+            inputs_embeds,
+            visual_token_rows,
+            deepstack_visual_embeds,
+        )
 
     def prepare_decode(self, seqs: list[Sequence]):
         # decode 阶段每条序列只输入一个 last_token。
@@ -662,7 +923,7 @@ class ModelRunner:
             positions = positions[0]
 
         # 将 slot_mapping 拷贝到 GPU。
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = self.copy_slot_mapping_to_device(slot_mapping)
 
         # 将上下文长度拷贝到 GPU。
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -678,13 +939,15 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         # 取出每条序列自己的 temperature。
-        temperatures = [seq.temperature for seq in seqs]
+        temperatures, all_greedy = prepare_sampling_inputs(
+            [seq.temperature for seq in seqs]
+        )
 
         # 转成 GPU 张量，Sampler 会按 batch 维度逐行缩放 logits。
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        temperatures = temperatures.pin_memory().cuda(non_blocking=True)
 
-        # 返回形状 [batch] 的 temperature 张量。
-        return temperatures
+        # 返回形状 [batch] 的 temperature 张量和 host 侧 greedy 标志。
+        return temperatures, all_greedy
 
     @torch.inference_mode()
     def run_model(
@@ -693,14 +956,22 @@ class ModelRunner:
         positions: torch.Tensor,
         is_prefill: bool,
         inputs_embeds: torch.Tensor | None = None,
+        visual_token_rows: torch.Tensor | None = None,
+        deepstack_visual_embeds: tuple[torch.Tensor, ...] = (),
     ):
         # prefill 长度变化大，直接 eager 跑；enforce_eager=True 时 decode 也直接 eager 跑。
         # decode batch size > 512 时也不用 CUDA graph，因为本实现只捕获到 512。
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            model_kwargs = {"inputs_embeds": inputs_embeds}
+            if visual_token_rows is not None or deepstack_visual_embeds:
+                model_kwargs.update(
+                    visual_token_rows=visual_token_rows,
+                    deepstack_visual_embeds=deepstack_visual_embeds,
+                )
             hidden_states = self.model(
                 None if inputs_embeds is not None else input_ids,
                 positions,
-                inputs_embeds=inputs_embeds,
+                **model_kwargs,
             )
             return self.model.compute_logits(hidden_states)
 
@@ -748,19 +1019,41 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         # 根据阶段准备 input_ids、positions 和 attention 所需上下文。
         if is_prefill:
-            input_ids, positions, inputs_embeds = self.prepare_prefill(seqs)
+            (
+                input_ids,
+                positions,
+                inputs_embeds,
+                visual_token_rows,
+                deepstack_visual_embeds,
+            ) = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs)
             inputs_embeds = None
+            visual_token_rows = None
+            deepstack_visual_embeds = ()
 
         # 只有 rank 0 需要 temperature，因为只有 rank 0 最终采样完整 logits。
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if self.rank == 0:
+            temperatures, all_greedy = self.prepare_sample(seqs)
+        else:
+            temperatures, all_greedy = None, None
 
         # 执行模型 forward，得到 logits。
-        logits = self.run_model(input_ids, positions, is_prefill, inputs_embeds)
+        logits = self.run_model(
+            input_ids,
+            positions,
+            is_prefill,
+            inputs_embeds,
+            visual_token_rows,
+            deepstack_visual_embeds,
+        )
 
         # rank 0 做采样并转成 Python list；其它 rank 返回 None。
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = (
+            self.sampler(logits, temperatures, all_greedy=all_greedy).tolist()
+            if self.rank == 0
+            else None
+        )
 
         # 清空本轮全局上下文，避免影响下一轮。
         reset_context()
@@ -788,7 +1081,7 @@ class ModelRunner:
         config = self.config
 
         # 读取模型结构配置。
-        hf_config = config.hf_config
+        text_config = effective_text_config(config.hf_config)
 
         # CUDA graph 最大只捕获到 512 条 decode 序列。
         max_bs = min(self.config.max_num_seqs, 512)
@@ -813,7 +1106,7 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
 
         # 固定地址模型输出 hidden states 缓冲。
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        outputs = torch.zeros(max_bs, text_config.hidden_size)
 
         # 预先捕获的 batch sizes：小 batch 精细一些，大 batch 每 16 一个档。
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))

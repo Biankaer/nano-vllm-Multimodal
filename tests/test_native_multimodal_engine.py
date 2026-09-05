@@ -1,5 +1,7 @@
 import unittest
 from types import MethodType
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -61,6 +63,14 @@ class FakeScheduler:
     def stats(self):
         return object()
 
+    def abort(self, seq_id):
+        for sequence in self.waiting:
+            if sequence.seq_id == seq_id:
+                self.waiting.remove(sequence)
+                sequence.mark_finished("abort")
+                return sequence
+        return None
+
 
 class NativeMultimodalEngineTests(unittest.TestCase):
     def setUp(self):
@@ -90,6 +100,15 @@ class NativeMultimodalEngineTests(unittest.TestCase):
         self.assertEqual(self.core.executor.released, [("vision:a",)])
         self.assertEqual(self.core.vision_stats(), "vision-stats")
 
+    def test_abort_sequence_releases_registered_vision_inputs(self):
+        sequence = make_multimodal_sequence()
+        vision_input = VisionInput("vision:a", torch.zeros(4, 8), (1, 2, 2))
+        self.core.scheduler.waiting = [sequence]
+        self.core.abort_sequence(sequence.seq_id)
+
+        self.assertEqual(self.core.executor.released, [("vision:a",)])
+        self.assertTrue(sequence.is_finished)
+
 
 class FakePromptProcessor:
     def __init__(self, materialized):
@@ -110,6 +129,49 @@ class SequenceAdmissionCore:
 
 
 class NativeMultimodalOfflineAPITests(unittest.TestCase):
+    def test_dynamic_admission_materializes_without_draining_engine(self):
+        metadata = make_multimodal_sequence().multimodal_metadata
+        materialized = MaterializedQwen25VLPrompt(
+            token_ids=(10, 11, 11, 12),
+            metadata=metadata,
+            vision_inputs=(),
+        )
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.multimodal_processor = FakePromptProcessor(materialized)
+        engine.core = SequenceAdmissionCore()
+
+        sequence_ids = engine.admit_multimodal_requests(
+            [[{"role": "user", "content": "hello"}]],
+            [[]],
+            [[]],
+            SamplingParams(temperature=0, max_tokens=2),
+        )
+
+        self.assertEqual(len(sequence_ids), 1)
+        self.assertEqual(sequence_ids[0], engine.core.admissions[0][0].seq_id)
+
+    def test_qwen3_engine_selects_adapter_processor_and_tokenizer(self):
+        tokenizer = SimpleNamespace(eos_token_id=42)
+        processor = SimpleNamespace(tokenizer=tokenizer)
+        adapter = Mock()
+        adapter.create_prompt_processor.return_value = processor
+        config = SimpleNamespace(
+            model="/model", hf_config=SimpleNamespace(model_type="qwen3_vl"), eos=-1,
+            kvcache_block_size=256,
+        )
+        with (
+            patch("nanovllm.engine.llm_engine.Config", return_value=config),
+            patch("nanovllm.engine.llm_engine.fields", return_value=()),
+            patch("nanovllm.engine.llm_engine.resolve_qwen_vl_adapter", return_value=adapter),
+            patch("nanovllm.engine.llm_engine.EngineCore", return_value=Mock()),
+            patch("nanovllm.engine.llm_engine.atexit.register"),
+        ):
+            engine = LLMEngine("/model")
+        adapter.create_prompt_processor.assert_called_once_with("/model")
+        self.assertIs(engine.multimodal_processor, processor)
+        self.assertIs(engine.tokenizer, tokenizer)
+        self.assertEqual(config.eos, 42)
+
     def test_materialized_prompt_enters_the_normal_sequence_scheduler(self):
         metadata = make_multimodal_sequence().multimodal_metadata
         vision_input = VisionInput("vision:a", torch.zeros(4, 8), (1, 2, 2))
@@ -142,6 +204,32 @@ class NativeMultimodalOfflineAPITests(unittest.TestCase):
         self.assertIs(sequence.multimodal_metadata, metadata)
         self.assertEqual(admitted_inputs, (vision_input,))
         self.assertEqual(outputs[0]["text"], "ok")
+
+    def test_multimodal_stream_materializes_and_uses_stream_drain(self):
+        metadata = make_multimodal_sequence().multimodal_metadata
+        materialized = MaterializedQwen25VLPrompt(
+            token_ids=(10, 11, 11, 12),
+            metadata=metadata,
+            vision_inputs=(),
+        )
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.multimodal_processor = FakePromptProcessor(materialized)
+        engine.core = SequenceAdmissionCore()
+
+        def fake_stream(self, sequence_ids):
+            yield (sequence_ids[0], "delta")
+
+        engine._drain_sequences_stream = MethodType(fake_stream, engine)
+
+        events = list(engine.generate_multimodal_stream(
+            [[{"role": "user", "content": "hello"}]],
+            [[]],
+            [[]],
+            SamplingParams(temperature=0, max_tokens=2),
+        ))
+
+        self.assertEqual(events[0][1], "delta")
+        self.assertEqual(len(engine.core.admissions), 1)
 
 
 if __name__ == "__main__":

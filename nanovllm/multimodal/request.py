@@ -13,6 +13,7 @@ class MultimodalGenerationRequest:
     max_new_tokens: int
     temperature: float
     top_p: float = 1.0
+    ignore_eos: bool = False
     arrival_time: float = field(default_factory=monotonic)
     internal_id: str = field(default_factory=lambda: f"mm-internal-{uuid4().hex}", init=False)
 
@@ -41,5 +42,10 @@ class MultimodalGenerationRequest:
         return max(1, (len(self.request.text) + 3) // 4)
 
     @property
-    def generation_key(self) -> tuple[int, float, float]:
-        return self.max_new_tokens, round(self.temperature, 6), round(self.top_p, 6)
+    def generation_key(self) -> tuple[int, float, float, bool]:
+        return (
+            self.max_new_tokens,
+            round(self.temperature, 6),
+            round(self.top_p, 6),
+            self.ignore_eos,
+        )

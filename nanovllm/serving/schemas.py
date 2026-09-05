@@ -15,7 +15,7 @@ class CompletionRequest(BaseModel):
         ge=1,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
     )
-    temperature: float = Field(default=1.0, gt=0.0)
+    temperature: float = Field(default=1.0, ge=0.0)
     stream: bool = False
     ignore_eos: bool = False
 
@@ -72,10 +72,15 @@ class ChatCompletionRequest(BaseModel):
         ge=1,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
     )
-    temperature: float = Field(default=1.0, gt=0.0)
+    temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     stream: bool = False
+    stream_options: "StreamOptions | None" = None
     ignore_eos: bool = False
+
+
+class StreamOptions(BaseModel):
+    include_usage: bool = False
 
 
 class ChatCompletionChoice(BaseModel):

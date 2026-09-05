@@ -113,6 +113,41 @@ class Qwen25VLModelTests(unittest.TestCase):
 
         self.assertIs(output, embeddings)
 
+    @patch("torch.distributed.get_rank", return_value=0)
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_model_ignores_empty_deepstack_payload(self, *_):
+        model = Qwen25VLForCausalLM(tiny_qwen25_config())
+        model.model.layers = nn.ModuleList()
+        model.model.norm = nn.Identity()
+        embeddings = torch.randn(3, 256)
+        positions = torch.arange(3).expand(3, -1)
+
+        output = model(
+            None,
+            positions,
+            inputs_embeds=embeddings,
+            visual_token_rows=torch.tensor([1]),
+            deepstack_visual_embeds=(),
+        )
+
+        self.assertIs(output, embeddings)
+
+    @patch("torch.distributed.get_rank", return_value=0)
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_model_explicitly_rejects_nonempty_deepstack_payload(self, *_):
+        model = Qwen25VLForCausalLM(tiny_qwen25_config())
+        embeddings = torch.randn(3, 256)
+        positions = torch.arange(3).expand(3, -1)
+
+        with self.assertRaisesRegex(NotImplementedError, "DeepStack"):
+            model(
+                None,
+                positions,
+                inputs_embeds=embeddings,
+                visual_token_rows=torch.tensor([1]),
+                deepstack_visual_embeds=(torch.randn(1, 256),),
+            )
+
 
 class Qwen3ModelInterfaceTests(unittest.TestCase):
     @patch("torch.distributed.get_rank", return_value=0)

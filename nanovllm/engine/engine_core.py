@@ -7,6 +7,7 @@ from nanovllm.engine.executor import Executor
 from nanovllm.engine.metrics import EngineStepStats, RequestTimingStats, SchedulerStats
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.streaming import TokenEvent
 from nanovllm.multimodal.qwen25_vl_processor import VisionInput
 
 
@@ -26,6 +27,7 @@ class EngineCore:
         self.step_id = 0
         self.latest_step_stats: EngineStepStats | None = None
         self.finished_request_stats: dict[int, RequestTimingStats] = {}
+        self._token_events: list[TokenEvent] = []
 
     def add_sequence(
         self,
@@ -46,8 +48,23 @@ class EngineCore:
         started = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        completion_counts = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         token_ids = self.executor.run(seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        token_events = getattr(self, "_token_events", None)
+        if token_events is None:
+            token_events = self._token_events = []
+        for seq in seqs:
+            first_new = completion_counts[seq.seq_id]
+            new_token_ids = seq.completion_token_ids[first_new:]
+            for index, token_id in enumerate(new_token_ids):
+                is_terminal = seq.is_finished and index == len(new_token_ids) - 1
+                token_events.append(TokenEvent(
+                    seq_id=seq.seq_id,
+                    token_id=token_id,
+                    finished=is_terminal,
+                    finish_reason=seq.finish_reason if is_terminal else None,
+                ))
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         for seq in seqs:
             if seq.is_finished:
@@ -60,6 +77,23 @@ class EngineCore:
             elapsed_sec=perf_counter() - started,
         )
         return outputs, num_tokens
+
+    def drain_token_events(self) -> list[TokenEvent]:
+        events = list(getattr(self, "_token_events", ()))
+        self._token_events = []
+        return events
+
+    def abort_sequence(self, seq_id: int) -> bool:
+        seq = self.scheduler.abort(seq_id)
+        if seq is None:
+            return False
+        self._token_events = [
+            event for event in getattr(self, "_token_events", ())
+            if event.seq_id != seq_id
+        ]
+        self.finished_request_stats[seq_id] = seq.timing_stats()
+        self.executor.release_vision_inputs(self._vision_feature_keys(seq))
+        return True
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()

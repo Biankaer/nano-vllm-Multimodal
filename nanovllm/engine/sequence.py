@@ -85,6 +85,9 @@ class Sequence:
         # 请求完成时间，用于计算总延迟和 TPOT。
         self.finish_time = None
 
+        # OpenAI-compatible terminal reason: stop, length, or abort.
+        self.finish_reason = None
+
         # 保存 prompt token ids 的副本；后续生成 token 会 append 到同一个列表。
         self.token_ids = copy(token_ids)
 
@@ -132,9 +135,11 @@ class Sequence:
         # 更新状态。
         self.status = SequenceStatus.RUNNING
 
-    def mark_finished(self):
+    def mark_finished(self, reason: str = "stop"):
         # 记录请求完成时间。
         self.finish_time = monotonic()
+
+        self.finish_reason = reason
 
         # 更新状态。
         self.status = SequenceStatus.FINISHED

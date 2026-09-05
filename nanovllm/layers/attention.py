@@ -1,52 +1,10 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
-import triton
-import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from nanovllm.layers.paged_kv.triton_backend import TritonPagedKVBackend
 from nanovllm.utils.context import get_context
-
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    # launch grid 是 (N,)，因此一个 Triton program 负责一个输入 token。
-    # 注意：Triton program 不等于单个 CUDA thread；program 内会并行处理 D 个元素。
-    idx = tl.program_id(0)
-
-    # slot_mapping[idx] 把“本轮第 idx 个 token”映射到 KV Cache 的物理 slot。
-    # 典型计算来源是：physical_block_id * block_size + block_offset。
-    slot = tl.load(slot_mapping_ptr + idx)
-
-    # -1 是无效 slot 的哨兵值，常用于 padding、被过滤 token 或未分配位置。
-    # 该 token 不应该修改 KV Cache。
-    if slot == -1: return
-
-    # key/value 的逻辑 shape 是 [N, num_kv_heads, head_dim]。
-    # D = num_kv_heads * head_dim，所以每个 token 的后两维被视为连续的一维向量。
-    # idx * key_stride 定位第 idx 个 token；arange(0, D) 枚举其全部 KV 元素。
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-
-    # 从本轮 QKV projection 的输出中读取当前 token 的全部 K/V。
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-
-    # Cache 被逻辑展平为 [num_slots, D]；slot * D 是目标物理 slot 的起点。
-    # 若物理布局原本是 [num_blocks, block_size, D]，前两维也可展平成 num_slots。
-    cache_offsets = slot * D + tl.arange(0, D)
-
-    # 将当前 token 的 K/V 写入相同物理 slot，供后续 Prefill/Decode Attention 读取。
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
 
 
 def store_kvcache(
@@ -66,32 +24,12 @@ def store_kvcache(
     该函数只负责数据面写入。slot 是否越界、不同 token 是否错误地映射到同一
     slot，必须由上游 Block Manager 和 Model Runner 保证。
     """
-    # 这里的 num_kv_heads 比 num_heads 更准确：GQA/MQA 中 Q Head 数可能更多。
-    N, num_kv_heads, head_dim = key.shape
-    D = num_kv_heads * head_dim
-
-    # Kernel 使用连续的 tl.arange(0, D) 搬运一个 token 的全部 KV，因此要求：
-    # 1. head_dim 内连续；2. 相邻 KV Head 紧密排列。
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
-
-    # 该检查隐含 Cache 布局近似为 [num_blocks, block_size, D]：
-    # 相邻 slot 在物理内存中相隔 D 个元素。
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
-
-    # 每个输入 token 必须恰好有一个物理 slot 映射。
-    assert slot_mapping.numel() == N
-
-    # 启动 N 个 Triton program：一个 program 负责一个 token 的 K/V Cache 写入。
-    store_kvcache_kernel[(N,)](
+    TritonPagedKVBackend().store(
         key,
-        key.stride(0),
         value,
-        value.stride(0),
         k_cache,
         v_cache,
         slot_mapping,
-        D,
     )
 
 
@@ -132,6 +70,7 @@ class Attention(nn.Module):
         # 空 Tensor 只是占位符。Model Runner 会在模型初始化/运行前，把每一层
         # 对应的预分配物理 KV Cache Tensor 赋给这两个属性。
         self.k_cache = self.v_cache = torch.tensor([])
+        self.paged_kv_backend = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # context 由 Scheduler/Block Manager/Model Runner 在调用模型前构造。
@@ -146,7 +85,12 @@ class Attention(nn.Module):
         # - Decode 每轮写入新 token，供下一轮使用。
         # 因此 Cache Store 是两个分支共享的前置步骤。
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if self.paged_kv_backend is None:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            else:
+                self.paged_kv_backend.store(
+                    k, v, k_cache, v_cache, context.slot_mapping
+                )
 
         if context.is_prefill:
             # 普通首次 Prefill 可以直接使用本轮连续的 k/v。
@@ -187,3 +131,171 @@ class Attention(nn.Module):
 
         # Prefill 输出对应本轮所有 Query token；Decode 输出对应每个请求的新 Query。
         return o
+
+
+class SDPAAttention(nn.Module):
+    """HF-aligned SDPA with NanoInfer's paged KV storage contract.
+
+    This is a numerical-reference backend for Qwen3-VL. It keeps paged KV as
+    the source of truth, but gathers each scheduled sequence into contiguous
+    K/V before calling PyTorch SDPA with the same GQA and causal semantics as
+    Transformers 4.57.6.
+    """
+
+    def __init__(self, num_heads, head_dim, scale, num_kv_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.paged_kv_backend = None
+
+    @staticmethod
+    def _prefix_causal_mask(query_length: int, key_length: int, device) -> torch.Tensor:
+        prefix_length = key_length - query_length
+        if prefix_length < 0:
+            raise ValueError("key length cannot be shorter than query length")
+        query_positions = torch.arange(query_length, device=device) + prefix_length
+        key_positions = torch.arange(key_length, device=device)
+        return key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+
+    @staticmethod
+    def _gather_paged(
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        if sequence_length < 0:
+            raise ValueError("sequence length must be non-negative")
+        block_size = cache.shape[1]
+        required_blocks = (sequence_length + block_size - 1) // block_size
+        if required_blocks == 0:
+            return cache.new_empty((0, *cache.shape[2:]))
+        block_ids = block_table[:required_blocks].to(device=cache.device, dtype=torch.long)
+        if not block_ids.is_cuda and torch.any(block_ids < 0):
+            raise ValueError("block table does not cover the requested sequence")
+        return cache.index_select(0, block_ids).flatten(0, 1)[:sequence_length]
+
+    def _sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        causal: bool,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        query = query.transpose(0, 1).unsqueeze(0)
+        key = key.transpose(0, 1).unsqueeze(0)
+        value = value.transpose(0, 1).unsqueeze(0)
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            scale=self.scale,
+            is_causal=causal,
+            enable_gqa=True,
+        )
+        return output.transpose(1, 2).reshape(-1, self.num_heads, self.head_dim)
+
+    def _gather_cache(
+        self,
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        if self.paged_kv_backend is None:
+            return self._gather_paged(cache, block_table, sequence_length)
+        return self.paged_kv_backend.gather(
+            cache, block_table, sequence_length
+        )
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+        if k_cache.numel() and v_cache.numel():
+            if self.paged_kv_backend is None:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            else:
+                self.paged_kv_backend.store(
+                    k, v, k_cache, v_cache, context.slot_mapping
+                )
+
+        outputs = []
+        if context.is_prefill:
+            request_count = context.cu_seqlens_q.numel() - 1
+            for request_index in range(request_count):
+                q_start = int(context.cu_seqlens_q[request_index])
+                q_end = int(context.cu_seqlens_q[request_index + 1])
+                k_start = int(context.cu_seqlens_k[request_index])
+                k_end = int(context.cu_seqlens_k[request_index + 1])
+                query = q[q_start:q_end]
+                query_length = q_end - q_start
+                key_length = k_end - k_start
+                full_length = (
+                    int(context.full_context_lens[request_index])
+                    if context.full_context_lens is not None
+                    else key_length
+                )
+                query_start = (
+                    int(context.query_start_lens[request_index])
+                    if context.query_start_lens is not None
+                    else key_length - query_length
+                )
+                if context.block_tables is None:
+                    key = k[k_start:k_end]
+                    value = v[k_start:k_end]
+                else:
+                    key = self._gather_cache(
+                        k_cache, context.block_tables[request_index], key_length
+                    )
+                    value = self._gather_cache(
+                        v_cache, context.block_tables[request_index], key_length
+                    )
+                query_suffix = full_length - query_start - query_length
+                key_suffix = full_length - key_length
+                if min(query_start, query_suffix, key_suffix) < 0:
+                    raise ValueError("SDPA received invalid full-context metadata")
+                query = torch.cat(
+                    (
+                        query.new_zeros(query_start, self.num_heads, self.head_dim),
+                        query,
+                        query.new_zeros(query_suffix, self.num_heads, self.head_dim),
+                    ),
+                    dim=0,
+                )
+                key = torch.cat(
+                    (key, key.new_zeros(key_suffix, self.num_kv_heads, self.head_dim)),
+                    dim=0,
+                )
+                value = torch.cat(
+                    (value, value.new_zeros(key_suffix, self.num_kv_heads, self.head_dim)),
+                    dim=0,
+                )
+                outputs.append(
+                    self._sdpa(query, key, value, causal=full_length > 1)
+                    [query_start:query_start + query_length]
+                )
+        else:
+            for request_index in range(q.shape[0]):
+                key_length = int(context.context_lens[request_index])
+                key = self._gather_cache(
+                    k_cache, context.block_tables[request_index], key_length
+                )
+                value = self._gather_cache(
+                    v_cache, context.block_tables[request_index], key_length
+                )
+                outputs.append(
+                    self._sdpa(
+                        q[request_index:request_index + 1],
+                        key,
+                        value,
+                        causal=False,
+                    )
+                )
+        return torch.cat(outputs, dim=0)

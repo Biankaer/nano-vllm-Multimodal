@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -12,21 +11,14 @@ from nanovllm.multimodal.qwen25_vl_runtime import (
     build_qwen25_vl_prompt_metadata,
     build_vision_feature_key,
 )
-from nanovllm.multimodal.runtime import MultimodalPromptMetadata
+from nanovllm.multimodal.runtime import (
+    MaterializedMultimodalPrompt,
+    VisionInput,
+)
 
 
-@dataclass(frozen=True, slots=True)
-class VisionInput:
-    feature_key: str
-    pixel_values: torch.Tensor
-    grid_thw: tuple[int, int, int]
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializedQwen25VLPrompt:
-    token_ids: tuple[int, ...]
-    metadata: MultimodalPromptMetadata
-    vision_inputs: tuple[VisionInput, ...]
+# Backward-compatible name retained for callers of the Qwen2.5-specific module.
+MaterializedQwen25VLPrompt = MaterializedMultimodalPrompt
 
 
 class Qwen25VLPromptProcessor:

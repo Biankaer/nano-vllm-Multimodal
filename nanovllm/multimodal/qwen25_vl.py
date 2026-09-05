@@ -34,6 +34,7 @@ class Qwen25VLBackend:
         max_new_tokens: int,
         temperature: float,
         top_p: float = 1.0,
+        ignore_eos: bool = False,
     ) -> str:
         return self.generate_chat_batch(
             [messages],
@@ -42,6 +43,7 @@ class Qwen25VLBackend:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
+            ignore_eos=ignore_eos,
         )[0]
 
     def generate_chat_batch(
@@ -53,6 +55,7 @@ class Qwen25VLBackend:
         max_new_tokens: int,
         temperature: float,
         top_p: float = 1.0,
+        ignore_eos: bool = False,
     ) -> list[str]:
         self._ensure_loaded()
         prompts = [
@@ -81,6 +84,8 @@ class Qwen25VLBackend:
             "max_new_tokens": max_new_tokens,
             "do_sample": do_sample,
         }
+        if ignore_eos:
+            generate_kwargs["eos_token_id"] = []
         if do_sample:
             generate_kwargs["temperature"] = temperature
             generate_kwargs["top_p"] = top_p

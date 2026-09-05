@@ -21,15 +21,13 @@ from nanovllm.sampling_params import SamplingParams
 
 # Sequence 表示一条推理请求在引擎内部的状态，包括 token、block table、生成进度等。
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.streaming import CumulativeTextDecoder, GenerationStreamEvent
 
 # EngineCore 负责请求生命周期、调度和执行编排。
 from nanovllm.engine.engine_core import EngineCore
 from nanovllm.engine.metrics import EngineStepStats, RequestTimingStats, SchedulerStats
-from nanovllm.multimodal.qwen25_vl_processor import (
-    Qwen25VLPromptProcessor,
-    VisionInput,
-)
-from nanovllm.multimodal.runtime import MultimodalPromptMetadata
+from nanovllm.multimodal.runtime import MultimodalPromptMetadata, VisionInput
+from nanovllm.models.qwen_vl_adapter import resolve_qwen_vl_adapter
 
 
 class LLMEngine:
@@ -56,8 +54,9 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
 
         self.multimodal_processor = None
-        if getattr(config.hf_config, "model_type", None) == "qwen2_5_vl":
-            self.multimodal_processor = Qwen25VLPromptProcessor.from_pretrained(config.model)
+        if getattr(config.hf_config, "model_type", None) in {"qwen2_5_vl", "qwen3_vl"}:
+            adapter = resolve_qwen_vl_adapter(config.hf_config)
+            self.multimodal_processor = adapter.create_prompt_processor(config.model)
             self.tokenizer = self.multimodal_processor.tokenizer
         else:
             # 加载 tokenizer；use_fast=True 使用 Rust 实现的 fast tokenizer。
@@ -211,6 +210,83 @@ class LLMEngine:
             sequence_ids.append(sequence.seq_id)
         return self._drain_sequences(sequence_ids, use_tqdm=use_tqdm)
 
+    def generate_multimodal_stream(
+        self,
+        messages_batch: list[list[dict[str, object]]],
+        images_batch: list[list[object]],
+        details_batch: list[list[str]] | None,
+        sampling_params: SamplingParams | list[SamplingParams],
+    ):
+        if self.multimodal_processor is None:
+            raise RuntimeError("the loaded model does not support native multimodal prompts")
+        if len(messages_batch) != len(images_batch):
+            raise ValueError("messages_batch and images_batch must have the same length")
+        if details_batch is None:
+            details_batch = [["auto"] * len(images) for images in images_batch]
+        if len(details_batch) != len(messages_batch):
+            raise ValueError("details_batch and messages_batch must have the same length")
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(messages_batch)
+        if len(sampling_params) != len(messages_batch):
+            raise ValueError("requests and sampling_params must have the same length")
+
+        materialized_prompts = [
+            self.multimodal_processor.materialize(messages, images, details)
+            for messages, images, details in zip(
+                messages_batch,
+                images_batch,
+                details_batch,
+            )
+        ]
+        sequence_ids = []
+        for prompt, request_sampling_params in zip(materialized_prompts, sampling_params):
+            sequence = self.add_request(
+                list(prompt.token_ids),
+                request_sampling_params,
+                multimodal_metadata=prompt.metadata,
+                vision_inputs=prompt.vision_inputs,
+            )
+            sequence_ids.append(sequence.seq_id)
+        yield from self._drain_sequences_stream(sequence_ids)
+
+    def admit_multimodal_requests(
+        self,
+        messages_batch: list[list[dict[str, object]]],
+        images_batch: list[list[object]],
+        details_batch: list[list[str]] | None,
+        sampling_params: SamplingParams | list[SamplingParams],
+    ) -> list[int]:
+        """Materialize multimodal prompts and admit without draining."""
+        if self.multimodal_processor is None:
+            raise RuntimeError("the loaded model does not support native multimodal prompts")
+        if len(messages_batch) != len(images_batch):
+            raise ValueError("messages_batch and images_batch must have the same length")
+        if details_batch is None:
+            details_batch = [["auto"] * len(images) for images in images_batch]
+        if len(details_batch) != len(messages_batch):
+            raise ValueError("details_batch and messages_batch must have the same length")
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(messages_batch)
+        if len(sampling_params) != len(messages_batch):
+            raise ValueError("requests and sampling_params must have the same length")
+
+        sequence_ids = []
+        for messages, images, details, request_sampling_params in zip(
+            messages_batch, images_batch, details_batch, sampling_params,
+        ):
+            prompt = self.multimodal_processor.materialize(messages, images, details)
+            sequence = self.add_request(
+                list(prompt.token_ids),
+                request_sampling_params,
+                multimodal_metadata=prompt.metadata,
+                vision_inputs=prompt.vision_inputs,
+            )
+            sequence_ids.append(sequence.seq_id)
+        return sequence_ids
+
+    def abort_sequence(self, seq_id: int) -> None:
+        self.core.abort_sequence(seq_id)
+
     def _drain_sequences(
         self,
         sequence_ids: list[int],
@@ -270,3 +346,47 @@ class LLMEngine:
 
         # 返回 List[dict]，每个 dict 对应一条 prompt。
         return outputs
+
+    def _drain_sequences_stream(
+        self,
+        sequence_ids: list[int],
+    ):
+        """Yield cumulative-decoded token events for an admitted request batch."""
+        sequence_to_index = {
+            seq_id: request_index
+            for request_index, seq_id in enumerate(sequence_ids)
+        }
+        decoders = {
+            seq_id: CumulativeTextDecoder(self.tokenizer)
+            for seq_id in sequence_ids
+        }
+        remaining = set(sequence_ids)
+        while remaining:
+            self.step()
+            for token_event in self.core.drain_token_events():
+                if token_event.seq_id not in sequence_to_index:
+                    raise RuntimeError(
+                        f"stream received event for unknown sequence {token_event.seq_id}"
+                    )
+                if token_event.seq_id not in remaining:
+                    raise RuntimeError(
+                        f"stream received event for completed sequence {token_event.seq_id}"
+                    )
+                text_delta = decoders[token_event.seq_id].append(token_event.token_id)
+                prompt_tokens = completion_tokens = None
+                if token_event.finished:
+                    stats = self.request_stats(token_event.seq_id)
+                    if stats is not None:
+                        prompt_tokens = stats.prompt_tokens
+                        completion_tokens = stats.completion_tokens
+                    remaining.remove(token_event.seq_id)
+                yield GenerationStreamEvent(
+                    request_index=sequence_to_index[token_event.seq_id],
+                    seq_id=token_event.seq_id,
+                    token_id=token_event.token_id,
+                    text_delta=text_delta,
+                    finished=token_event.finished,
+                    finish_reason=token_event.finish_reason,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import tempfile
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import TypeVar
 
 import torch
 import torch.distributed as dist
@@ -20,18 +23,42 @@ from nanovllm.engine.model_runner import (
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen25_vl import Qwen25VLForCausalLM
 from nanovllm.multimodal.qwen25_vl_processor import Qwen25VLPromptProcessor
+from nanovllm.multimodal.runtime import VisionFeatureBundle
 from nanovllm.multimodal.vision_provider import VisionFeatureProvider
 from nanovllm.utils.context import reset_context, set_context
 from nanovllm.utils.loader import load_model
 
 
-def parse_args() -> argparse.Namespace:
+_T = TypeVar("_T")
+
+
+def run_verification_stage(operation: Callable[[], _T]) -> _T:
+    try:
+        return operation()
+    finally:
+        # The operation frame must be gone before empty_cache so model/tensor
+        # references have actually been released.  This matters when --mode
+        # all starts a second engine in the same Python process.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def qwen25_final_embedding(bundle: VisionFeatureBundle) -> torch.Tensor:
+    if not isinstance(bundle, VisionFeatureBundle):
+        raise TypeError("Qwen2.5-VL vision provider must return a feature bundle")
+    if bundle.deepstack_embeddings:
+        raise ValueError("Qwen2.5-VL feature bundle must not contain DeepStack embeddings")
+    return bundle.final_embedding
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify the native Qwen2.5-VL runtime on one GPU")
     parser.add_argument("--model", required=True)
     parser.add_argument("--image", default="assets/logo.png")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--mode", choices=("alignment", "cache", "all"), default="all")
-    return parser.parse_args()
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
+    return parser.parse_args(argv)
 
 
 def make_messages(*, system: bool = False, long_prompt: bool = False) -> list[dict[str, object]]:
@@ -115,7 +142,9 @@ def verify_alignment(model_path: str, image: Image.Image, device: str) -> dict[s
         positions = torch.tensor(materialized.metadata.position_ids, dtype=torch.int64, device=device)
         plan = plan_visual_replacements([sequence])
         with torch.inference_mode(), provider.resolve_pinned(plan.required_feature_keys) as features:
-            native_features = features[plan.required_feature_keys[0]]
+            native_features = qwen25_final_embedding(
+                features[plan.required_feature_keys[0]]
+            )
             inputs_embeds = merge_planned_visual_embeddings(
                 native_model.embed(input_ids),
                 plan,
@@ -178,7 +207,12 @@ def verify_alignment(model_path: str, image: Image.Image, device: str) -> dict[s
         Path(rendezvous_path).unlink(missing_ok=True)
 
 
-def verify_cache(model_path: str, image: Image.Image) -> dict[str, object]:
+def verify_cache(
+    model_path: str,
+    image: Image.Image,
+    *,
+    gpu_memory_utilization: float = 0.4,
+) -> dict[str, object]:
     llm = LLM(
         model_path,
         enforce_eager=True,
@@ -186,10 +220,10 @@ def verify_cache(model_path: str, image: Image.Image) -> dict[str, object]:
         max_num_batched_tokens=1536,
         max_num_seqs=4,
         max_model_len=1536,
-        gpu_memory_utilization=0.4,
+        gpu_memory_utilization=gpu_memory_utilization,
         vision_feature_cache_bytes=256 * 1024**2,
     )
-    sampling_params = SamplingParams(temperature=0.01, max_tokens=1)
+    sampling_params = SamplingParams(temperature=0, max_tokens=1)
     snapshots = []
     try:
         for label, messages in (
@@ -223,9 +257,17 @@ def main() -> None:
     image = Image.open(args.image).convert("RGB")
     results = {}
     if args.mode in {"alignment", "all"}:
-        results["alignment"] = verify_alignment(args.model, image, args.device)
+        results["alignment"] = run_verification_stage(
+            lambda: verify_alignment(args.model, image, args.device)
+        )
     if args.mode in {"cache", "all"}:
-        results["cache"] = verify_cache(args.model, image)
+        results["cache"] = run_verification_stage(
+            lambda: verify_cache(
+                args.model,
+                image,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+        )
     print(json.dumps(results, indent=2))
 
 
